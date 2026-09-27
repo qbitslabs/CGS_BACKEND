@@ -1,0 +1,1337 @@
+// CGS clinic PostgreSQL schema: staff, catalog, visits, billing, WhatsApp threads.
+// Source of truth for the clinic API. The AI service uses a separate Postgres.
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// -----------------------------------------------------------------------------
+// ENUMS
+// -----------------------------------------------------------------------------
+
+enum UserRole {
+  DOCTOR
+  EMPLOYEE
+}
+
+enum UserStatus {
+  ACTIVE
+  DISABLED
+}
+
+enum AdminRole {
+  SUPER_ADMIN
+  PLATFORM_ADMIN
+  SUPPORT_ADMIN
+  BILLING_ADMIN
+}
+
+enum AdminStatus {
+  ACTIVE
+  INACTIVE
+  SUSPENDED
+}
+
+enum ClinicStatus {
+  PROVISIONING
+  ACTIVE
+  SUSPENDED
+  DEACTIVATED
+}
+
+enum SubscriptionTier {
+  STARTER
+  GROWTH
+  ENTERPRISE
+  CUSTOM
+}
+
+enum SubscriptionStatus {
+  TRIAL
+  ACTIVE
+  PAST_DUE
+  SUSPENDED
+  CANCELLED
+  EXPIRED
+}
+
+enum LeadStatus {
+  NEW
+  CONTACTED
+  QUALIFIED
+  APPOINTMENT_REQUESTED
+  BOOKED
+  CONVERTED
+  LOST
+}
+
+enum LeadSource {
+  WHATSAPP
+  WEBSITE
+  GOOGLE_AD
+  INSTAGRAM
+  WALK_IN
+  REFERRAL
+}
+
+enum LeadIntent {
+  HIGH
+  MEDIUM
+  LOW
+}
+
+enum PatientStatus {
+  ACTIVE
+  INACTIVE
+  PENDING_FOLLOWUP
+}
+
+enum Gender {
+  MALE
+  FEMALE
+  OTHER
+}
+
+enum AppointmentStatus {
+  SCHEDULED
+  CONFIRMED
+  COMPLETED
+  CANCELLED
+  RESCHEDULED
+  NO_SHOW
+}
+
+enum ConversationState {
+  AI_ACTIVE
+  HUMAN_ACTIVE
+  HANDOFF_PENDING
+  CLOSED
+}
+
+enum MessageDirection {
+  INBOUND
+  OUTBOUND
+}
+
+enum MessageSenderType {
+  PATIENT
+  AI
+  USER
+  SYSTEM
+}
+
+enum MessageStatus {
+  PENDING
+  SENT
+  DELIVERED
+  READ
+  FAILED
+}
+
+enum WhatsappEventStatus {
+  RECEIVED
+  PROCESSED
+  FAILED
+  IGNORED
+}
+
+enum InvoiceStatus {
+  DRAFT
+  ISSUED
+  PARTIALLY_PAID
+  PAID
+  VOID
+}
+
+enum PaymentStatus {
+  PENDING
+  COMPLETED
+  FAILED
+  REFUNDED
+  VOID
+}
+
+enum PaymentMethod {
+  CASH
+  UPI
+  CARD
+  BANK_TRANSFER
+  OTHER
+}
+
+enum SubscriptionInvoiceStatus {
+  DRAFT
+  ISSUED
+  PAID
+  PARTIALLY_PAID
+  OVERDUE
+  VOID
+}
+
+enum SubscriptionPaymentStatus {
+  PENDING
+  COMPLETED
+  FAILED
+  REFUNDED
+}
+
+enum UsageType {
+  AI
+  WHATSAPP
+}
+
+enum JobStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+  RETRYING
+  CANCELLED
+}
+
+enum NotificationType {
+  NEW_LEAD
+  NEW_CONVERSATION
+  HUMAN_HANDOFF
+  APPOINTMENT_REMINDER
+  APPOINTMENT_CHANGE
+  SYSTEM_NOTIFICATION
+}
+
+enum AiEntityType {
+  CLINIC
+  CHATBOT
+  ECOMMERCE
+  RESTAURANT
+  EDUCATION
+  REAL_ESTATE
+}
+
+enum AiOperationType {
+  CONVERSATION_RESPONSE
+  SUMMARY_ADDON
+  SUMMARY_MERGE
+  SUMMARY_REBUILD
+  TOOL_EXECUTION
+}
+
+enum SummaryStatus {
+  READY
+  PROCESSING
+  FAILED
+}
+
+enum SummaryTriggerReason {
+  INACTIVITY
+  MANUAL
+  CRASH_RECOVERY
+  CONVERSATION_CLOSE
+  TOKEN_THRESHOLD
+}
+
+enum SummaryAddonType {
+  PATIENT_PREFERENCE
+  APPOINTMENT_PREFERENCE
+  SERVICE_INTEREST
+  PATIENT_INTENT
+  IMPORTANT_CONTEXT
+  PATIENT_CONCERN
+  COMMUNICATION_PREFERENCE
+  FOLLOW_UP_REQUIRED
+  HUMAN_HANDOFF
+  BOOKING_CONTEXT
+  OTHER
+}
+
+enum SummaryAddonStatus {
+  PENDING
+  PROCESSING
+  MERGED
+  FAILED
+  DISCARDED
+}
+
+// -----------------------------------------------------------------------------
+// CORE PLATFORM & MULTI-TENANCY MODELS
+// -----------------------------------------------------------------------------
+
+model Clinic {
+  id                    String                @id @default(uuid()) @db.Uuid
+  name                  String
+  slug                  String?               @unique
+  landingPageId         String?               @unique @map("landing_page_id")
+  status                ClinicStatus          @default(PROVISIONING)
+  phone                 String?
+  email                 String?
+  address               String?
+  city                  String?
+  state                 String?
+  postalCode            String?               @map("postal_code")
+  gstin                 String?
+  website               String?
+  description           String?
+  logoUrl               String?               @map("logo_url")
+  workingDays           String[]              @default(["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]) @map("working_days")
+  openingTime           String?               @default("09:00") @map("opening_time")
+  closingTime           String?               @default("19:00") @map("closing_time")
+  workingHours          String?               @map("working_hours")
+  timezone              String                @default("Asia/Kolkata")
+  currency              String                @default("INR")
+  createdAt             DateTime              @default(now()) @map("created_at")
+  updatedAt             DateTime              @updatedAt @map("updated_at")
+
+  users                 User[]
+  doctors               Doctor[]
+  doctorServices        DoctorService[]
+  doctorSchedules       DoctorSchedule[]
+  doctorAvailabilities  DoctorAvailability[]
+  services              Service[]
+  leads                 Lead[]
+  patients              Patient[]
+  appointments          Appointment[]
+  conversations         Conversation[]
+  messages              Message[]
+  whatsappAccounts      WhatsappAccount[]
+  whatsappEvents        WhatsappEvent[]
+  invoices              Invoice[]
+  payments              Payment[]
+  paymentAuthorizations PaymentAuthorization[]
+  cgsSubscriptions      CgsSubscription[]
+  subscriptionInvoices  SubscriptionInvoice[]
+  subscriptionPayments  SubscriptionPayment[]
+  paymentMethods        PaymentMethodRecord[]
+  metaCampaigns         MetaCampaign[]
+  metaCampaignMetrics   MetaCampaignMetric[]
+  metaCreatives         MetaCreative[]
+  metaCreativeMetrics   MetaCreativeMetric[]
+  whatsappUsage         WhatsAppUsage[]
+  notifications         Notification[]
+  auditLogs             AuditLog[]
+  jobs                  Job[]
+  aiConfig              EntityAiConfig?
+  aiUsage               AiUsage[]
+  conversationSummaries ConversationSummary[]
+  conversationSummaryAddons ConversationSummaryAddon[]
+  landingPage           ClinicLandingPage?
+  workflowConfig        ClinicWorkflowConfig?
+
+  @@index([status])
+  @@index([createdAt])
+  @@index([landingPageId])
+  @@map("clinics")
+}
+
+model AdminUser {
+  id                    String                @id @default(uuid()) @db.Uuid
+  email                 String                @unique
+  passwordHash          String                @map("password_hash")
+  name                  String
+  role                  AdminRole             @default(PLATFORM_ADMIN)
+  status                AdminStatus           @default(ACTIVE)
+  permissions           String[]              @default([])
+  lastLoginAt           DateTime?             @map("last_login_at")
+  createdAt             DateTime              @default(now()) @map("created_at")
+  updatedAt             DateTime              @updatedAt @map("updated_at")
+
+  @@map("admin_users")
+}
+
+model User {
+  id                    String                @id @default(uuid()) @db.Uuid
+  clinicId              String                @map("clinic_id") @db.Uuid
+  email                 String
+  passwordHash          String?               @map("password_hash")
+  firstName             String                @map("first_name")
+  lastName              String?               @map("last_name")
+  title                 String?
+  phone                 String?
+  role                  UserRole              @default(EMPLOYEE)
+  status                UserStatus            @default(ACTIVE)
+  lastLoginAt           DateTime?             @map("last_login_at")
+  createdAt             DateTime              @default(now()) @map("created_at")
+  updatedAt             DateTime              @updatedAt @map("updated_at")
+
+  clinic                Clinic                @relation(fields: [clinicId], references: [id], onDelete: Restrict)
+  doctor                Doctor?
+  appointmentsCreated   Appointment[]         @relation("AppointmentCreatedBy")
+  invoicesCreated       Invoice[]             @relation("InvoiceCreatedBy")
+  paymentsCollected     Payment[]             @relation("PaymentCollectedBy")
+  notifications         Notification[]
+  auditLogs             AuditLog[]
+
+  @@unique([clinicId, email])
+  @@index([clinicId, role])
+  @@index([clinicId, status])
+  @@map("users")
+}
+
+model Doctor {
+  id                    String                @id @default(uuid()) @db.Uuid
+  clinicId              String                @map("clinic_id") @db.Uuid
+  userId                String                @unique @map("user_id") @db.Uuid
+  specialization        String?
+  registrationNo        String?               @map("registration_no")
+  qualification         String?
+  experienceYears       Int?                  @map("experience_years")
+  consultationFee       Decimal?              @map("consultation_fee") @db.Decimal(12, 2)
+  availabilityDays      String[]              @default(["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]) @map("availability_days")
+  availabilityHours     String?               @default("09:00 AM - 07:00 PM") @map("availability_hours")
+  isActive              Boolean               @default(true) @map("is_active")
+  isPrimary             Boolean               @default(false) @map("is_primary")
+  createdAt             DateTime              @default(now()) @map("created_at")
+  updatedAt             DateTime              @updatedAt @map("updated_at")
+
+  clinic                Clinic                @relation(fields: [clinicId], references: [id], onDelete: Restrict)
+  user                  User                  @relation(fields: [userId], references: [id], onDelete: Restrict)
+  appointments          Appointment[]
+  doctorServices        DoctorService[]
+  schedules             DoctorSchedule[]
+  availabilities        DoctorAvailability[]
+  conversations         Conversation[]
+  aiUsage               AiUsage[]
+  treatedInvoices       Invoice[]             @relation("InvoiceTreatingDoctor")
+
+  @@index([clinicId, isActive])
+  @@map("doctors")
+}
+
+model DoctorService {
+  id                    String                @id @default(uuid()) @db.Uuid
+  clinicId              String                @map("clinic_id") @db.Uuid
+  doctorId              String                @map("doctor_id") @db.Uuid
+  serviceId             String                @map("service_id") @db.Uuid
+  customPrice           Decimal?              @map("custom_price") @db.Decimal(12, 2)
+  customDurationMinutes Int?                  @map("custom_duration_minutes")
+  isActive              Boolean               @default(true) @map("is_active")
+  createdAt             DateTime              @default(now()) @map("created_at")
+  updatedAt             DateTime              @updatedAt @map("updated_at")
+
+  clinic                Clinic                @relation(fields: [clinicId], references: [id], onDelete: Restrict)
+  doctor                Doctor                @relation(fields: [doctorId], references: [id], onDelete: Cascade)
+  service               Service               @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+
+  @@unique([doctorId, serviceId])
+  @@index([clinicId, doctorId])
+  @@index([serviceId])
+  @@map("doctor_services")
+}
+
+model DoctorSchedule {
+  id                    String                @id @default(uuid()) @db.Uuid
+  clinicId              String                @map("clinic_id") @db.Uuid
+  doctorId              String                @map("doctor_id") @db.Uuid
+  dayOfWeek             String                @map("day_of_week") // e.g. MONDAY, TUESDAY or 0-6
+  startTime             String                @map("start_time")   // e.g. "09:00"
+  endTime               String                @map("end_time")     // e.g. "17:00"
+  breakStartTime        String?               @map("break_start_time")
+  breakEndTime          String?               @map("break_end_time")
+  slotDurationMinutes   Int                   @default(30) @map("slot_duration_minutes")
+  maxBookingsPerSlot    Int                   @default(1) @map("max_bookings_per_slot")
+  isActive              Boolean               @default(true) @map("is_active")
+  createdAt             DateTime              @default(now()) @map("created_at")
+  updatedAt             DateTime              @updatedAt @map("updated_at")
+
+  clinic                Clinic                @relation(fields: [clinicId], references: [id], onDelete: Restrict)
+  doctor                Doctor                @relation(fields: [doctorId], references: [id], onDelete: Cascade)
+
+  @@index([clinicId, doctorId, dayOfWeek])
+  @@map("doctor_schedules")
+}
+
+model DoctorAvailability {
+  id                    String                @id @default(uuid()) @db.Uuid
+  clinicId              String                @map("clinic_id") @db.Uuid
+  doctorId              String                @map("doctor_id") @db.Uuid
+  date                  DateTime              @db.Date
+  startTime             String                @map("start_time")
+  endTime               String                @map("end_time")
+  isAvailable           Boolean               @default(true) @map("is_available")
+  reason                String?
+  createdAt             DateTime              @default(now()) @map("created_at")
+  updatedAt             DateTime              @updatedAt @map("updated_at")
+
+  clinic                Clinic                @relation(fields: [clinicId], references: [id], onDelete: Restrict)
+  doctor                Doctor                @relation(fields: [doctorId], references: [id], onDelete: Cascade)
+
+  @@index([clinicId, doctorId, date])
+  @@map("doctor_availability")
+}
+
+model Service {
+  id                    String                @id @default(uuid()) @db.Uuid
+  clinicId              String                @map("clinic_id") @db.Uuid
+  name                  String
+  description           String?
+  durationMinutes       Int                   @default(30) @map("duration_minutes")
+  price                 Decimal               @db.Decimal(12, 2)
+  category              String?               @default("General")
+  isActive              Boolean               @default(true) @map("is_active")
+  createdAt             DateTime              @default(now()) @map("created_at")
+  updatedAt             DateTime              @updatedAt @map("updated_at")
+
+  clinic                Clinic                @relation(fields: [clinicId], references: [id], onDelete: Restrict)
+  doctorServices        DoctorService[]
+  appointmentServices   AppointmentService[]
+  invoiceItems          InvoiceItem[]
+
+  @@unique([clinicId, name])
+  @@index([clinicId, isActive])
+  @@map("services")
+}
+
+// -----------------------------------------------------------------------------
+// CRM & PATIENT MODELS
+// -----------------------------------------------------------------------------
+
+model Lead {
+  id                    String                @id @default(uuid()) @db.Uuid
+  clinicId              String                @map("clinic_id") @db.Uuid
+  name                  String
+  phone                 String
+  email                 String?
+  source                LeadSource            @default(WHATSAPP)
+  status                LeadStatus            @default(NEW)
+  score                 Int                   @default(50)
+  interestedService     String?               @map("interested_service")
+  preferredDoctor       String?               @map("preferred_doctor")
+  howHeardAboutDoctor   String?               @map("how_heard_about_doctor")
+  intent                LeadIntent            @default(MEDIUM)
+  notes                 String?
+  assignedToUserId      String?               @map("assigned_to_user_id") @db.Uuid
+  convertedPatientId    String?               @unique @map("converted_patient_id") @db.Uuid
+  createdAt             DateTime              @default(now()) @map("created_at")
+  updatedAt             DateTime              @updatedAt @map("updated_at")
+
+  clinic                Clinic                @relation(fields: [clinicId], references: [id], onDelete: Restrict)
+  convertedPatient      Patient?              @relation(fields: [convertedPatientId], references: [id], onDelete: SetNull)
+  conversations         Conversation[]
+  activities            LeadActivity[]
+
+  @@index([clinicId, status])
+  @@index([clinicId, phone])
+  @@index([clinicId, createdAt])
+  @@map("leads")
+}
+
+model LeadActivity {
+  id                    String                @id @default(uuid()) @db.Uuid
+  leadId                String                @map("lead_id") @db.Uuid
+  type                  String                // 'created', 'status_change', 'message', 'assignment', 'appointment', 'note'
+  title                 String
+  description           String
+  actor                 String
+  createdAt             DateTime              @default(now()) @map("created_at")
+
+  lead                  Lead                  @relation(fields: [leadId], references: [id], onDelete: Cascade)
+
+  @@index([leadId, createdAt])
+  @@map("lead_activities")
+}
+
+model Patient {
+  id                    String                @id @default(uuid()) @db.Uuid
+  clinicId              String                @map("clinic_id") @db.Uuid
+  name                  String
+  phone                 String
+  email                 String?
+  gender                Gender                @default(OTHER)
+  age                   Int?
+  dateOfBirth           DateTime?             @map("date_of_birth")
+  bloodGroup            String?               @map("blood_group")
+  address               String?
+  allergies             String[]              @default([])
+  medicalHistoryNotes   String?               @map("medical_history_notes")
+  status                PatientStatus         @default(ACTIVE)
+  leadId                String?               @unique @map("lead_id") @db.Uuid
+  createdAt             DateTime              @default(now()) @map("created_at")
+  updatedAt             DateTime              @updatedAt @map("updated_at")
+
+  clinic                Clinic                @relation(fields: [clinicId], references: [id], onDelete: Restrict)
+  lead                  Lead?
+  appointments          Appointment[]
+  conversations         Conversation[]
+  invoices              Invoice[]
+  payments              Payment[]
+  activities            PatientActivity[]
+
+  @@index([clinicId, phone])
+  @@index([clinicId, status])
+  @@index([clinicId, createdAt])
+  @@map("patients")
+}
+
+model PatientActivity {
+  id                    String                @id @default(uuid()) @db.Uuid
+  patientId             String                @map("patient_id") @db.Uuid
+  type                  String                // 'appointment', 'note', 'conversation', 'profile_update'
+  title                 String
+  description           String
+  actor                 String
+  createdAt             DateTime              @default(now()) @map("created_at")
+
+  patient               Patient               @relation(fields: [patientId], references: [id], onDelete: Cascade)
+
+  @@index([patientId, createdAt])
+  @@map("patient_activities")
+}
+
+// -----------------------------------------------------------------------------
+// APPOINTMENTS & SCHEDULING MODELS
+// -----------------------------------------------------------------------------
+
+model Appointment {
+  id                    String                @id @default(uuid()) @db.Uuid
+  clinicId              String                @map("clinic_id") @db.Uuid
+  patientId             String                @map("patient_id") @db.Uuid
+  doctorId              String?               @map("doctor_id") @db.Uuid
+  service               String?
+  status                AppointmentStatus     @default(SCHEDULED)
+  startsAt              DateTime              @map("starts_at")
+  endsAt                DateTime              @map("ends_at")
+  durationMinutes       Int                   @default(30) @map("duration_minutes")
+  notes                 String?
+  createdByUserId       String?               @map("created_by_user_id") @db.Uuid
+  createdAt             DateTime              @default(now()) @map("created_at")
+  updatedAt             DateTime              @updatedAt @map("updated_at")
+
+  clinic                Clinic                @relation(fields: [clinicId], references: [id], onDelete: Restrict)
+  patient               Patient               @relation(fields: [patientId], references: [id], onDelete: Restrict)
+  doctor                Doctor?               @relation(fields: [doctorId], references: [id], onDelete: SetNull)
+  createdBy             User?                 @relation("AppointmentCreatedBy", fields: [createdByUserId], references: [id], onDelete: SetNull)
+  services              AppointmentService[]
+
+  @@index([clinicId, startsAt])
+  @@index([clinicId, doctorId, startsAt])
+  @@index([clinicId, patientId])
+  @@map("appointments")
+}
+
+model AppointmentService {
+  appointmentId         String                @map("appointment_id") @db.Uuid
+  serviceId             String                @map("service_id") @db.Uuid
+
+  appointment           Appointment           @relation(fields: [appointmentId], references: [id], onDelete: Cascade)
+  service               Service               @relation(fields: [serviceId], references: [id], onDelete: Restrict)
+
+  @@id([appointmentId, serviceId])
+  @@map("appointment_services")
+}
+
+// -----------------------------------------------------------------------------
+// WHATSAPP & CONVERSATION MODELS
+// -----------------------------------------------------------------------------
+
+model WhatsappAccount {
+  id                    String                @id @default(uuid()) @db.Uuid
+  clinicId              String                @map("clinic_id") @db.Uuid
+  phoneNumberId         String                @unique @map("phone_number_id")
+  businessAccountId     String?               @map("business_account_id")
+  displayPhoneNumber    String?               @map("display_phone_number")
+  accessTokenEncrypted  String                @map("access_token_encrypted")
+  apiVersion            String?               @default("v19.0") @map("api_version")
+  webhookUrl            String?               @map("webhook_url")
+  verifyToken           String?               @map("verify_token")
+  webhookStatus         String?               @default("PENDING") @map("webhook_status")
+  messageTemplates      Json?                 @map("message_templates")
+  qualityRating         String?               @default("High") @map("quality_rating")
+  isActive              Boolean               @default(true) @map("is_active")
+  createdAt             DateTime              @default(now()) @map("created_at")
+  updatedAt             DateTime              @updatedAt @map("updated_at")
+
+  clinic                Clinic                @relation(fields: [clinicId], references: [id], onDelete: Restrict)
+  conversations         Conversation[]
+  events                WhatsappEvent[]
+  messages              Message[]
+  usage                 WhatsAppUsage[]
+
+  @@index([clinicId, isActive])
+  @@map("whatsapp_accounts")
+}
+
+model WhatsappEvent {
+  id                    String                @id @default(uuid()) @db.Uuid
+  clinicId              String?               @map("clinic_id") @db.Uuid
+  whatsappAccountId     String?               @map("whatsapp_account_id") @db.Uuid
+  providerEventId       String                @unique @map("provider_event_id")
+  eventType             String                @map("event_type")
+  payload               Json
+  status                WhatsappEventStatus   @default(RECEIVED)
+  errorMessage          String?               @map("error_message")
+  processedAt           DateTime?             @map("processed_at")
+  createdAt             DateTime              @default(now()) @map("created_at")
+
+  clinic                Clinic?               @relation(fields: [clinicId], references: [id], onDelete: SetNull)
+  whatsappAccount       WhatsappAccount?      @relation(fields: [whatsappAccountId], references: [id], onDelete: SetNull)
+
+  @@index([clinicId, createdAt])
+  @@map("whatsapp_events")
+}
+
+model Conversation {
+  id                    String                @id @default(uuid()) @db.Uuid
+  clinicId              String                @map("clinic_id") @db.Uuid
+  patientId             String?               @map("patient_id") @db.Uuid
+  leadId                String?               @map("lead_id") @db.Uuid
+  whatsappAccountId     String?               @map("whatsapp_account_id") @db.Uuid
+  participantName       String                @map("participant_name")
+  participantPhone      String                @map("participant_phone")
+  state                 ConversationState     @default(AI_ACTIVE)
+  unreadCount           Int                   @default(0) @map("unread_count")
+  assignedToUserId      String?               @map("assigned_to_user_id") @db.Uuid
+  doctorId              String?               @map("doctor_id") @db.Uuid
+  serviceInterested     String?               @map("service_interested")
+  handoffReason         String?               @map("handoff_reason")
+  internalNotes         String?               @map("internal_notes")
+  lastMessageText       String?               @map("last_message_text")
+  lastMessageAt         DateTime?             @map("last_message_at")
+  lastActivityAt        DateTime?             @map("last_activity_at")
+  createdAt             DateTime              @default(now()) @map("created_at")
+  updatedAt             DateTime              @updatedAt @map("updated_at")
+
+  clinic                Clinic                @relation(fields: [clinicId], references: [id], onDelete: Restrict)
+  doctor                Doctor?               @relation(fields: [doctorId], references: [id], onDelete: SetNull)
+  patient               Patient?              @relation(fields: [patientId], references: [id], onDelete: SetNull)
+  lead                  Lead?                 @relation(fields: [leadId], references: [id], onDelete: SetNull)
+  whatsappAccount       WhatsappAccount?      @relation(fields: [whatsappAccountId], references: [id], onDelete: SetNull)
+  messages              Message[]
+  summary               ConversationSummary?
+  summaryVersions       ConversationSummaryVersion[]
+  summaryAddons         ConversationSummaryAddon[]
+  aiUsage               AiUsage[]
+
+  @@index([clinicId, state])
+  @@index([clinicId, lastMessageAt])
+  @@index([clinicId, lastActivityAt])
+  @@index([clinicId, doctorId, lastActivityAt])
+  @@index([clinicId, participantPhone])
+  @@map("conversations")
+}
+
+model Message {
+  id                    String                @id @default(uuid()) @db.Uuid
+  clinicId              String                @map("clinic_id") @db.Uuid
+  conversationId        String                @map("conversation_id") @db.Uuid
+  whatsappAccountId     String?               @map("whatsapp_account_id") @db.Uuid
+  direction             MessageDirection
+  senderType            MessageSenderType
+  senderName            String                @map("sender_name")
+  content               String?
+  mediaUrl              String?               @map("media_url")
+  mediaType             String?               @map("media_type")
+  providerMessageId     String?               @unique @map("provider_message_id")
+  status                MessageStatus         @default(PENDING)
+  isAiGenerated         Boolean               @default(false) @map("is_ai_generated")
+  createdAt             DateTime              @default(now()) @map("created_at")
+
+  clinic                Clinic                @relation(fields: [clinicId], references: [id], onDelete: Restrict)
+  conversation          Conversation          @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  whatsappAccount       WhatsappAccount?      @relation(fields: [whatsappAccountId], references: [id], onDelete: SetNull)
+  summaryAddons         ConversationSummaryAddon[]
+  aiUsage               AiUsage[]
+
+  @@index([clinicId, conversationId, createdAt])
+  @@map("messages")
+}
+
+// -----------------------------------------------------------------------------
+// PATIENT BILLING & TREATMENT INVOICES
+// -----------------------------------------------------------------------------
+
+model Invoice {
+  id                    String                @id @default(uuid()) @db.Uuid
+  clinicId              String                @map("clinic_id") @db.Uuid
+  patientId             String                @map("patient_id") @db.Uuid
+  invoiceNumber         String                @map("invoice_number")
+  service               String?
+  status                InvoiceStatus         @default(DRAFT)
+  subtotal              Decimal               @db.Decimal(12, 2)
+  discount              Decimal               @default(0) @db.Decimal(12, 2)
+  tax                   Decimal               @default(0) @db.Decimal(12, 2)
+  total                 Decimal               @db.Decimal(12, 2)
+  amountPaid            Decimal               @default(0) @map("amount_paid") @db.Decimal(12, 2)
+  amountDue             Decimal               @default(0) @map("amount_due") @db.Decimal(12, 2)
+  paymentMethod         PaymentMethod?        @map("payment_method")
+  notes                 String?
+  createdByUserId       String?               @map("created_by_user_id") @db.Uuid
+  treatingDoctorId      String?               @map("treating_doctor_id") @db.Uuid
+  issuedAt              DateTime?             @map("issued_at")
+  dueDate               DateTime?             @map("due_date")
+  createdAt             DateTime              @default(now()) @map("created_at")
+  updatedAt             DateTime              @updatedAt @map("updated_at")
+
+  clinic                Clinic                @relation(fields: [clinicId], references: [id], onDelete: Restrict)
+  patient               Patient               @relation(fields: [patientId], references: [id], onDelete: Restrict)
+  createdBy             User?                 @relation("InvoiceCreatedBy", fields: [createdByUserId], references: [id], onDelete: SetNull)
+  treatingDoctor        Doctor?               @relation("InvoiceTreatingDoctor", fields: [treatingDoctorId], references: [id], onDelete: SetNull)
+  items                 InvoiceItem[]
+  payments              Payment[]
+
+  @@unique([clinicId, invoiceNumber])
+  @@index([clinicId, patientId])
+  @@index([clinicId, status])
+  @@map("invoices")
+}
+
+model InvoiceItem {
+  id                    String                @id @default(uuid()) @db.Uuid
+  invoiceId             String                @map("invoice_id") @db.Uuid
+  serviceId             String?               @map("service_id") @db.Uuid
+  name                  String
+  quantity              Decimal               @db.Decimal(10, 2)
+  unitPrice             Decimal               @map("unit_price") @db.Decimal(12, 2)
+  total                 Decimal               @db.Decimal(12, 2)
+
+  invoice               Invoice               @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  service               Service?              @relation(fields: [serviceId], references: [id], onDelete: SetNull)
+
+  @@index([invoiceId])
+  @@map("invoice_items")
+}
+
+model Payment {
+  id                    String                @id @default(uuid()) @db.Uuid
+  clinicId              String                @map("clinic_id") @db.Uuid
+  invoiceId             String                @map("invoice_id") @db.Uuid
+  patientId             String                @map("patient_id") @db.Uuid
+  amount                Decimal               @db.Decimal(12, 2)
+  method                PaymentMethod
+  status                PaymentStatus         @default(PENDING)
+  referenceNumber       String?               @map("reference_number")
+  remarks               String?
+  collectedByUserId     String?               @map("collected_by_user_id") @db.Uuid
+  createdAt             DateTime              @default(now()) @map("created_at")
+
+  clinic                Clinic                @relation(fields: [clinicId], references: [id], onDelete: Restrict)
+  invoice               Invoice               @relation(fields: [invoiceId], references: [id], onDelete: Restrict)
+  patient               Patient               @relation(fields: [patientId], references: [id], onDelete: Restrict)
+  collectedBy           User?                 @relation("PaymentCollectedBy", fields: [collectedByUserId], references: [id], onDelete: SetNull)
+  authorization         PaymentAuthorization?
+
+  @@index([clinicId, invoiceId])
+  @@index([clinicId, createdAt])
+  @@map("payments")
+}
+
+model PaymentAuthorization {
+  id                    String                @id @default(uuid()) @db.Uuid
+  clinicId              String                @map("clinic_id") @db.Uuid
+  paymentId             String                @unique @map("payment_id") @db.Uuid
+  authorizedByUserId    String                @map("authorized_by_user_id") @db.Uuid
+  passcodeVerified      Boolean               @default(true) @map("passcode_verified")
+  reason                String?
+  authorizedAt          DateTime              @default(now()) @map("authorized_at")
+
+  clinic                Clinic                @relation(fields: [clinicId], references: [id], onDelete: Restrict)
+  payment               Payment               @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+
+  @@map("payment_authorizations")
+}
+
+// -----------------------------------------------------------------------------
+// SAAS SUBSCRIPTION & USAGE METERING MODELS
+// -----------------------------------------------------------------------------
+
+model SubscriptionPlan {
+  id                    String                @id @default(uuid()) @db.Uuid
+  name                  String                @unique
+  tier                  SubscriptionTier      @default(ENTERPRISE)
+  priceMonthly          Decimal               @map("price_monthly") @db.Decimal(12, 2)
+  currency              String                @default("INR")
+  billingCycle          String                @default("MONTHLY") @map("billing_cycle")
+  features              String[]              @default([])
+  whatsappIncluded      Int                   @default(1000) @map("whatsapp_included")
+  aiTokensIncluded      Int                   @default(1000000) @map("ai_tokens_included")
+  overageRateWhatsApp   Decimal               @default(0.40) @map("overage_rate_whatsapp") @db.Decimal(14, 8)
+  overageRateAi1k       Decimal               @default(0.15) @map("overage_rate_ai_1k") @db.Decimal(14, 8)
+  isActive              Boolean               @default(true) @map("is_active")
+  createdAt             DateTime              @default(now()) @map("created_at")
+  updatedAt             DateTime              @updatedAt @map("updated_at")
+
+  subscriptions         CgsSubscription[]
+
+  @@map("subscription_plans")
+}
+
+model CgsSubscription {
+  id                    String                @id @default(uuid()) @db.Uuid
+  clinicId              String                @map("clinic_id") @db.Uuid
+  planId                String                @map("plan_id") @db.Uuid
+  status                SubscriptionStatus    @default(ACTIVE)
+  startDate             DateTime              @map("start_date")
+  endDate               DateTime?             @map("end_date")
+  currentPeriodStart    DateTime              @map("current_period_start")
+  currentPeriodEnd      DateTime              @map("current_period_end")
+  autoRenew             Boolean               @default(true) @map("auto_renew")
+  createdAt             DateTime              @default(now()) @map("created_at")
+  updatedAt             DateTime              @updatedAt @map("updated_at")
+
+  clinic                Clinic                @relation(fields: [clinicId], references: [id], onDelete: Restrict)
+  plan                  SubscriptionPlan      @relation(fields: [planId], references: [id], onDelete: Restrict)
+  invoices              SubscriptionInvoice[]
+
+  @@index([clinicId, status])
+  @@map("cgs_subscriptions")
+}
+
+model SubscriptionInvoice {
+  id                    String                    @id @default(uuid()) @db.Uuid
+  clinicId              String                    @map("clinic_id") @db.Uuid
+  subscriptionId        String                    @map("subscription_id") @db.Uuid
+  invoiceNumber         String                    @map("invoice_number")
+  subtotal              Decimal                   @db.Decimal(12, 2)
+  usageCharges          Decimal                   @default(0) @map("usage_charges") @db.Decimal(12, 2)
+  adjustments           Decimal                   @default(0) @db.Decimal(12, 2)
+  total                 Decimal                   @db.Decimal(12, 2)
+  status                SubscriptionInvoiceStatus @default(DRAFT)
+  periodStart           DateTime                  @map("period_start")
+  periodEnd             DateTime                  @map("period_end")
+  issuedAt              DateTime?                 @map("issued_at")
+  dueAt                 DateTime?                 @map("due_at")
+  createdAt             DateTime                  @default(now()) @map("created_at")
+
+  clinic                Clinic                    @relation(fields: [clinicId], references: [id], onDelete: Restrict)
+  subscription          CgsSubscription           @relation(fields: [subscriptionId], references: [id], onDelete: Restrict)
+  payments              SubscriptionPayment[]
+
+  @@unique([clinicId, invoiceNumber])
+  @@index([clinicId, status])
+  @@map("subscription_invoices")
+}
+
+model SubscriptionPayment {
+  id                    String                    @id @default(uuid()) @db.Uuid
+  clinicId              String                    @map("clinic_id") @db.Uuid
+  invoiceId             String                    @map("invoice_id") @db.Uuid
+  amount                Decimal                   @db.Decimal(12, 2)
+  status                SubscriptionPaymentStatus @default(PENDING)
+  provider              String?                   // 'RAZORPAY', 'STRIPE', 'KNITPAY'
+  providerPaymentId     String?                   @map("provider_payment_id")
+  createdAt             DateTime                  @default(now()) @map("created_at")
+
+  clinic                Clinic                    @relation(fields: [clinicId], references: [id], onDelete: Restrict)
+  invoice               SubscriptionInvoice       @relation(fields: [invoiceId], references: [id], onDelete: Restrict)
+
+  @@index([clinicId, createdAt])
+  @@map("subscription_payments")
+}
+
+model PaymentMethodRecord {
+  id                    String                @id @default(uuid()) @db.Uuid
+  clinicId              String                @map("clinic_id") @db.Uuid
+  brand                 String                @default("Mastercard")
+  last4                 String
+  expiry                String
+  providerCustomerId    String?               @map("provider_customer_id")
+  isDefault             Boolean               @default(true) @map("is_default")
+  createdAt             DateTime              @default(now()) @map("created_at")
+
+  clinic                Clinic                @relation(fields: [clinicId], references: [id], onDelete: Restrict)
+
+  @@index([clinicId])
+  @@map("payment_methods")
+}
+
+model UsageRate {
+  id                    String                @id @default(uuid()) @db.Uuid
+  type                  UsageType
+  provider              String?
+  model                 String?
+  unit                  String
+  rate                  Decimal               @db.Decimal(14, 8)
+  effectiveFrom         DateTime              @map("effective_from")
+  effectiveTo           DateTime?             @map("effective_to")
+  createdAt             DateTime              @default(now()) @map("created_at")
+
+  @@index([type, effectiveFrom])
+  @@map("usage_rates")
+}
+
+model WhatsAppUsage {
+  id                    String                @id @default(uuid()) @db.Uuid
+  clinicId              String                @map("clinic_id") @db.Uuid
+  whatsappAccountId     String?               @map("whatsapp_account_id") @db.Uuid
+  type                  String                @default("CONVERSATION") // 'MESSAGE', 'CONVERSATION', 'TEMPLATE'
+  quantity              Int                   @default(1)
+  unitCost              Decimal               @map("unit_cost") @db.Decimal(14, 8)
+  totalCost             Decimal               @map("total_cost") @db.Decimal(14, 8)
+  providerReference     String?               @map("provider_reference")
+  createdAt             DateTime              @default(now()) @map("created_at")
+
+  clinic                Clinic                @relation(fields: [clinicId], references: [id], onDelete: Restrict)
+  whatsappAccount       WhatsappAccount?      @relation(fields: [whatsappAccountId], references: [id], onDelete: SetNull)
+
+  @@index([clinicId, createdAt])
+  @@map("whatsapp_usage")
+}
+
+// -----------------------------------------------------------------------------
+// META ADS & MARKETING MODELS
+// -----------------------------------------------------------------------------
+
+model MetaCampaign {
+  id                    String                @id @default(uuid()) @db.Uuid
+  clinicId              String                @map("clinic_id") @db.Uuid
+  metaCampaignId        String                @map("meta_campaign_id")
+  name                  String
+  objective             String?
+  platform              String                @default("Instagram & Facebook")
+  status                String                @default("Active")
+  dailyBudget           Decimal               @map("daily_budget") @db.Decimal(12, 2)
+  startDate             DateTime?             @map("start_date")
+  createdAt             DateTime              @default(now()) @map("created_at")
+  updatedAt             DateTime              @updatedAt @map("updated_at")
+
+  clinic                Clinic                @relation(fields: [clinicId], references: [id], onDelete: Restrict)
+  metrics               MetaCampaignMetric[]
+  creatives             MetaCreative[]
+
+  @@unique([clinicId, metaCampaignId])
+  @@index([clinicId, status])
+  @@map("meta_campaigns")
+}
+
+model MetaCampaignMetric {
+  id                    String                @id @default(uuid()) @db.Uuid
+  clinicId              String                @map("clinic_id") @db.Uuid
+  campaignId            String                @map("campaign_id") @db.Uuid
+  date                  DateTime              @db.Date
+  spend                 Decimal               @db.Decimal(12, 2)
+  impressions           Int                   @default(0)
+  clicks                Int                   @default(0)
+  leads                 Int                   @default(0)
+  createdAt             DateTime              @default(now()) @map("created_at")
+
+  clinic                Clinic                @relation(fields: [clinicId], references: [id], onDelete: Restrict)
+  campaign              MetaCampaign          @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+
+  @@unique([campaignId, date])
+  @@index([clinicId, date])
+  @@map("meta_campaign_metrics")
+}
+
+model MetaCreative {
+  id                    String                @id @default(uuid()) @db.Uuid
+  clinicId              String                @map("clinic_id") @db.Uuid
+  campaignId            String?               @map("campaign_id") @db.Uuid
+  metaCreativeId        String                @map("meta_creative_id")
+  title                 String
+  targetProcedure       String                @map("target_procedure")
+  headline              String
+  primaryText           String                @map("primary_text")
+  format                String                @default("Video Reel")
+  thumbnailColor        String?               @map("thumbnail_color")
+  thumbnailUrl          String?               @map("thumbnail_url")
+  status                String                @default("Active")
+  createdAt             DateTime              @default(now()) @map("created_at")
+  updatedAt             DateTime              @updatedAt @map("updated_at")
+
+  clinic                Clinic                @relation(fields: [clinicId], references: [id], onDelete: Restrict)
+  campaign              MetaCampaign?         @relation(fields: [campaignId], references: [id], onDelete: SetNull)
+  metrics               MetaCreativeMetric[]
+
+  @@unique([clinicId, metaCreativeId])
+  @@map("meta_creatives")
+}
+
+model MetaCreativeMetric {
+  id                    String                @id @default(uuid()) @db.Uuid
+  clinicId              String                @map("clinic_id") @db.Uuid
+  creativeId            String                @map("creative_id") @db.Uuid
+  date                  DateTime              @db.Date
+  spend                 Decimal               @db.Decimal(12, 2)
+  impressions           Int                   @default(0)
+  clicks                Int                   @default(0)
+  leads                 Int                   @default(0)
+  createdAt             DateTime              @default(now()) @map("created_at")
+
+  clinic                Clinic                @relation(fields: [clinicId], references: [id], onDelete: Restrict)
+  creative              MetaCreative          @relation(fields: [creativeId], references: [id], onDelete: Cascade)
+
+  @@unique([creativeId, date])
+  @@index([clinicId, date])
+  @@map("meta_creative_metrics")
+}
+
+// -----------------------------------------------------------------------------
+// NOTIFICATIONS & AUDIT LOGS
+// -----------------------------------------------------------------------------
+
+model Notification {
+  id                    String                @id @default(uuid()) @db.Uuid
+  clinicId              String                @map("clinic_id") @db.Uuid
+  userId                String?               @map("user_id") @db.Uuid
+  type                  NotificationType      @default(SYSTEM_NOTIFICATION)
+  title                 String
+  message               String
+  isRead                Boolean               @default(false) @map("is_read")
+  link                  String?
+  entityId              String?               @map("entity_id")
+  createdAt             DateTime              @default(now()) @map("created_at")
+  readAt                DateTime?             @map("read_at")
+
+  clinic                Clinic                @relation(fields: [clinicId], references: [id], onDelete: Restrict)
+  user                  User?                 @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([clinicId, isRead, createdAt])
+  @@index([userId, isRead, createdAt])
+  @@map("notifications")
+}
+
+model AuditLog {
+  id                    String                @id @default(uuid()) @db.Uuid
+  clinicId              String?               @map("clinic_id") @db.Uuid
+  userId                String?               @map("user_id") @db.Uuid
+  actorId               String                @map("actor_id")
+  actorEmail            String                @map("actor_email")
+  actorType             String                @default("CLINIC_USER") @map("actor_type") // 'ADMIN', 'SYSTEM', 'CLINIC_USER'
+  action                String
+  resourceType          String                @map("resource_type")
+  resourceId            String?               @map("resource_id")
+  metadata              Json?
+  diffBefore            Json?                 @map("diff_before")
+  diffAfter             Json?                 @map("diff_after")
+  ipAddress             String?               @map("ip_address")
+  userAgent             String?               @map("user_agent")
+  requestId             String?               @map("request_id")
+  createdAt             DateTime              @default(now()) @map("created_at")
+
+  clinic                Clinic?               @relation(fields: [clinicId], references: [id], onDelete: SetNull)
+  user                  User?                 @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([clinicId, createdAt])
+  @@index([action, createdAt])
+  @@map("audit_logs")
+}
+
+// -----------------------------------------------------------------------------
+// DURABLE BACKGROUND JOBS QUEUE
+// -----------------------------------------------------------------------------
+
+model Job {
+  id                    String                @id @default(uuid()) @db.Uuid
+  clinicId              String?               @map("clinic_id") @db.Uuid
+  queue                 String                @default("DEFAULT")
+  type                  String                @map("job_type")
+  status                JobStatus             @default(PENDING)
+  priority              Int                   @default(0)
+  payload               Json
+  attempts              Int                   @default(0)
+  maxAttempts           Int                   @default(3) @map("max_attempts")
+  availableAt           DateTime              @default(now()) @map("available_at")
+  lockedAt              DateTime?             @map("locked_at")
+  lockedBy              String?               @map("locked_by")
+  lastError             String?               @map("last_error")
+  createdAt             DateTime              @default(now()) @map("created_at")
+  updatedAt             DateTime              @updatedAt @map("updated_at")
+  completedAt           DateTime?             @map("completed_at")
+
+  clinic                Clinic?               @relation(fields: [clinicId], references: [id], onDelete: SetNull)
+
+  @@index([status, availableAt])
+  @@index([type, status])
+  @@index([clinicId, status])
+  @@map("jobs")
+}
+
+// -----------------------------------------------------------------------------
+// AI ENGINE, CONVERSATION MEMORY & USAGE MODELS (ENTITY-CENTRIC ARCHITECTURE)
+// -----------------------------------------------------------------------------
+
+model EntityAiConfig {
+  id                         String       @id @default(uuid()) @db.Uuid
+  entityType                 AiEntityType @default(CLINIC) @map("entity_type")
+  entityId                   String       @map("entity_id")
+  clinicId                   String?      @unique @map("clinic_id") @db.Uuid
+  isAiEnabled                Boolean      @default(true) @map("is_ai_enabled")
+  systemPrompt               String?      @map("system_prompt")
+  customInstructions         String?      @map("custom_instructions")
+  tone                       String       @default("professional") // 'professional', 'warm', 'concise'
+  language                   String       @default("en") // 'en', 'hi', 'hinglish'
+  primaryProvider            String       @default("google") @map("primary_provider")
+  primaryModel               String       @default("google/gemma-4-31b-it") @map("primary_model")
+  fallbackProvider           String?      @map("fallback_provider")
+  fallbackModel              String?      @map("fallback_model")
+  temperature                Decimal      @default(0.2) @db.Decimal(3, 2)
+  maxTokens                  Int          @default(1000) @map("max_tokens")
+  enabledTools               String[]     @default(["get_patient", "get_lead", "get_services", "get_doctors", "check_availability", "book_appointment", "get_clinic_info", "faq", "knowledge_base"]) @map("enabled_tools")
+  inactivityThresholdMinutes Int          @default(60) @map("inactivity_threshold_minutes")
+  humanHandoffKeywords       String[]     @default(["human", "doctor", "receptionist", "speak to someone", "agent", "emergency"]) @map("human_handoff_keywords")
+  metadata                   Json?
+  createdAt                  DateTime     @default(now()) @map("created_at")
+  updatedAt                  DateTime     @updatedAt @map("updated_at")
+
+  clinic                     Clinic?      @relation(fields: [clinicId], references: [id], onDelete: Cascade)
+
+  @@unique([entityType, entityId])
+  @@index([entityType, isAiEnabled])
+  @@map("entity_ai_configs")
+}
+
+model ClinicLandingPage {
+  id                  String   @id @default(uuid()) @db.Uuid
+  clinicId            String   @unique @map("clinic_id") @db.Uuid
+  landingPageId       String   @unique @map("landing_page_id")
+  title               String?
+  shortDescription    String?  @map("short_description")
+  primaryCta          String?  @map("primary_cta")
+  whatsappNumber      String?  @map("whatsapp_number")
+  enquiryFormEnabled  Boolean  @default(true) @map("enquiry_form_enabled")
+  services            Json?
+  doctors             Json?
+  address             String?
+  additionalInfo      String?  @map("additional_info")
+  config              Json?
+  isPublished         Boolean  @default(false) @map("is_published")
+  createdAt           DateTime @default(now()) @map("created_at")
+  updatedAt           DateTime @updatedAt @map("updated_at")
+
+  clinic              Clinic   @relation(fields: [clinicId], references: [id], onDelete: Cascade)
+
+  @@index([landingPageId])
+  @@map("clinic_landing_pages")
+}
+
+model ClinicWorkflowConfig {
+  id                    String   @id @default(uuid()) @db.Uuid
+  clinicId              String   @unique @map("clinic_id") @db.Uuid
+  qualificationEnabled  Boolean  @default(true) @map("qualification_enabled")
+  appointmentEnabled    Boolean  @default(true) @map("appointment_enabled")
+  reminderEnabled       Boolean  @default(true) @map("reminder_enabled")
+  followUpEnabled       Boolean  @default(true) @map("follow_up_enabled")
+  noResponseEnabled     Boolean  @default(true) @map("no_response_enabled")
+  staffHandoffEnabled   Boolean  @default(true) @map("staff_handoff_enabled")
+  followUpHours         Int      @default(24) @map("follow_up_hours")
+  reminderHoursBefore   Int      @default(24) @map("reminder_hours_before")
+  leadStatusFlow        Json?    @map("lead_status_flow")
+  config                Json?
+  createdAt             DateTime @default(now()) @map("created_at")
+  updatedAt             DateTime @updatedAt @map("updated_at")
+
+  clinic                Clinic   @relation(fields: [clinicId], references: [id], onDelete: Cascade)
+
+  @@map("clinic_workflow_configs")
+}
+
+model ConversationSummary {
+  id                  String                       @id @default(uuid()) @db.Uuid
+  entityType          AiEntityType                 @default(CLINIC) @map("entity_type")
+  entityId            String?                      @map("entity_id")
+  clinicId            String?                      @map("clinic_id") @db.Uuid
+  conversationId      String                       @unique @map("conversation_id") @db.Uuid
+  version             Int                          @default(1)
+  summaryText         String                       @map("summary_text")
+  summaryJson         Json                         @map("summary_json")
+  lastMessageId       String?                      @map("last_message_id") @db.Uuid
+  lastMergedAddonId   String?                      @map("last_merged_addon_id") @db.Uuid
+  status              SummaryStatus                @default(READY)
+  processingStartedAt DateTime?                    @map("processing_started_at")
+  processingLockedBy  String?                      @map("processing_locked_by")
+  createdAt           DateTime                     @default(now()) @map("created_at")
+  updatedAt           DateTime                     @updatedAt @map("updated_at")
+
+  clinic              Clinic?                      @relation(fields: [clinicId], references: [id], onDelete: SetNull)
+  conversation        Conversation                 @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  versions            ConversationSummaryVersion[]
+
+  @@index([entityType, entityId])
+  @@index([clinicId, status])
+  @@index([status, updatedAt])
+  @@map("conversation_summaries")
+}
+
+model ConversationSummaryVersion {
+  id                    String                @id @default(uuid()) @db.Uuid
+  conversationSummaryId String                @map("conversation_summary_id") @db.Uuid
+  conversationId        String                @map("conversation_id") @db.Uuid
+  version               Int
+  summaryText           String                @map("summary_text")
+  summaryJson           Json                  @map("summary_json")
+  mergedAddonIds        String[]              @default([]) @map("merged_addon_ids")
+  triggerReason         SummaryTriggerReason  @default(INACTIVITY) @map("trigger_reason")
+  tokensUsed            Int                   @default(0) @map("tokens_used")
+  aiCost                Decimal               @default(0) @map("ai_cost") @db.Decimal(14, 8)
+  createdAt             DateTime              @default(now()) @map("created_at")
+
+  summary               ConversationSummary   @relation(fields: [conversationSummaryId], references: [id], onDelete: Cascade)
+  conversation          Conversation          @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  @@unique([conversationSummaryId, version])
+  @@index([conversationId, version])
+  @@map("conversation_summary_versions")
+}
+
+model ConversationSummaryAddon {
+  id                  String             @id @default(uuid()) @db.Uuid
+  entityType          AiEntityType       @default(CLINIC) @map("entity_type")
+  entityId            String?            @map("entity_id")
+  clinicId            String?            @map("clinic_id") @db.Uuid
+  conversationId      String             @map("conversation_id") @db.Uuid
+  messageId           String?            @map("message_id") @db.Uuid
+  type                SummaryAddonType
+  content             String
+  metadata            Json?
+  status              SummaryAddonStatus @default(PENDING)
+  processingStartedAt DateTime?          @map("processing_started_at")
+  error               String?
+  createdAt           DateTime           @default(now()) @map("created_at")
+  processedAt         DateTime?          @map("processed_at")
+  mergedAt            DateTime?          @map("merged_at")
+
+  clinic              Clinic?            @relation(fields: [clinicId], references: [id], onDelete: SetNull)
+  conversation        Conversation       @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  message             Message?           @relation(fields: [messageId], references: [id], onDelete: SetNull)
+
+  @@index([entityType, entityId, status])
+  @@index([clinicId, status])
+  @@index([conversationId, status])
+  @@index([createdAt])
+  @@map("conversation_summary_addons")
+}
+
+model AiUsage {
+  id                  String             @id @default(uuid()) @db.Uuid
+  entityType          AiEntityType       @default(CLINIC) @map("entity_type")
+  entityId            String             @map("entity_id")
+  clinicId            String?            @map("clinic_id") @db.Uuid
+  doctorId            String?            @map("doctor_id") @db.Uuid
+  conversationId      String?            @map("conversation_id") @db.Uuid
+  messageId           String?            @map("message_id") @db.Uuid
+  requestId           String             @map("request_id")
+  operationType       AiOperationType    @default(CONVERSATION_RESPONSE) @map("operation_type")
+  provider            String
+  model               String
+  inputTokens         Int                @default(0) @map("input_tokens")
+  outputTokens        Int                @default(0) @map("output_tokens")
+  totalTokens         Int                @default(0) @map("total_tokens")
+  inputCost           Decimal            @default(0) @map("input_cost") @db.Decimal(14, 8)
+  outputCost          Decimal            @default(0) @map("output_cost") @db.Decimal(14, 8)
+  totalCost           Decimal            @default(0) @map("total_cost") @db.Decimal(14, 8)
+  currency            String             @default("INR")
+  durationMs          Int                @default(0) @map("duration_ms")
+  success             Boolean            @default(true)
+  errorCode           String?            @map("error_code")
+  metadata            Json?
+  createdAt           DateTime           @default(now()) @map("created_at")
+
+  clinic              Clinic?            @relation(fields: [clinicId], references: [id], onDelete: SetNull)
+  doctor              Doctor?            @relation(fields: [doctorId], references: [id], onDelete: SetNull)
+  conversation        Conversation?      @relation(fields: [conversationId], references: [id], onDelete: SetNull)
+  message             Message?           @relation(fields: [messageId], references: [id], onDelete: SetNull)
+
+  @@index([entityType, entityId, createdAt])
+  @@index([entityId, createdAt])
+  @@index([clinicId, createdAt])
+  @@index([clinicId, doctorId, createdAt])
+  @@index([doctorId, createdAt])
+  @@index([doctorId, totalCost])
+  @@index([requestId])
+  @@index([operationType, createdAt])
+  @@index([entityId, totalCost])
+  @@index([clinicId, totalCost])
+  @@map("ai_usage")
+}
