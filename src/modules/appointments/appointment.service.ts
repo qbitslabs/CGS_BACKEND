@@ -12,6 +12,7 @@ import {
   clinicDayBoundsUtc,
   clinicTimeString,
   clinicWeekday,
+  dropPastSlots,
   resolveClinicTimezone,
 } from '../../utils/timezone.js';
 
@@ -560,7 +561,11 @@ export class AppointmentService {
       bookedCountBySlot.set(label, (bookedCountBySlot.get(label) || 0) + 1);
     }
     const bookedSlots = [...bookedCountBySlot.entries()].filter(([, count]) => count >= capacity).map(([label]) => label);
-    const availableSlots = allSlots.filter((slot) => (bookedCountBySlot.get(slot) || 0) < capacity);
+    const availableSlots = dropPastSlots(
+      allSlots.filter((slot) => (bookedCountBySlot.get(slot) || 0) < capacity),
+      cleanDateStr,
+      timeZone
+    );
 
     return {
       date: targetDate,

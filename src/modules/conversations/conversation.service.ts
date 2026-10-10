@@ -12,10 +12,12 @@ import { AppError } from '../../middleware/errorHandler.js';
 import { logAuditEvent } from '../../middleware/audit.js';
 import { aiClient } from '../ai/ai.client.js';
 import { prisma } from '../../config/db.js';
+import { env } from '../../config/env.js';
+import { decryptToken } from '../../utils/crypto.js';
 import { randomUUID } from 'crypto';
 
 // Two WhatsApp bubbles in a short burst → one AI reply (join texts).
-const AI_REPLY_DEBOUNCE_MS = 1600;
+const AI_REPLY_DEBOUNCE_MS = 400;
 
 type PendingAi = {
   clinicId: string;
@@ -375,7 +377,7 @@ export class ConversationService {
           ? `Samajh gaya — yeh urgent lag raha hai. Main abhi clinic staff ko alert kar rahi hoon. Emergency me 112/ambulance bhi consider karein. Staff jaldi join karega.`
           : `Theek hai, main aapko human staff se connect kar rahi hoon. Koi coordinator jaldi reply karega.`;
 
-      const message = await this.repo.persistAiOutboundMessage({
+      const message = await this.deliverAiWhatsApp({
         clinicId,
         conversationId,
         content: replyText,
@@ -486,7 +488,7 @@ export class ConversationService {
     }
 
     // If AI tool requested handoff during generation, state may already be HANDOFF_PENDING.
-    const message = await this.repo.persistAiOutboundMessage({
+    const message = await this.deliverAiWhatsApp({
       clinicId,
       conversationId,
       content: replyText,
@@ -497,6 +499,100 @@ export class ConversationService {
       message: this.mapMessage(message),
       toolCalls: raw?.tool_calls || raw?.data?.tool_calls || [],
     };
+  }
+
+  /** Save the AI line, then hand it to WhatsApp in this same job. */
+  private async deliverAiWhatsApp(params: {
+    clinicId: string;
+    conversationId: string;
+    content: string;
+    recipientPhone?: string | null;
+  }) {
+    const message = await this.repo.persistAiOutboundMessage({
+      clinicId: params.clinicId,
+      conversationId: params.conversationId,
+      content: params.content,
+      recipientPhone: params.recipientPhone || undefined,
+    });
+
+    if (!params.recipientPhone) return message;
+
+    const sent = await this.pushWhatsAppText({
+      clinicId: params.clinicId,
+      messageId: message.id,
+      recipientPhone: params.recipientPhone,
+      content: params.content,
+    });
+
+    if (!sent) {
+      try {
+        await prisma.job.create({
+          data: {
+            clinicId: params.clinicId,
+            queue: 'WHATSAPP',
+            type: 'WHATSAPP_SEND',
+            payload: {
+              messageId: message.id,
+              conversationId: params.conversationId,
+              recipientPhone: params.recipientPhone,
+              content: params.content,
+            },
+          },
+        });
+      } catch (err: any) {
+        console.error('[AI Receptionist] Could not queue WhatsApp retry:', err?.message || err);
+      }
+    }
+
+    return message;
+  }
+
+  private async pushWhatsAppText(params: {
+    clinicId: string;
+    messageId: string;
+    recipientPhone: string;
+    content: string;
+  }): Promise<boolean> {
+    try {
+      const account = await prisma.whatsAppAccount.findFirst({
+        where: { clinicId: params.clinicId, status: 'CONNECTED' },
+      });
+      if (!account?.phoneNumberId || !account.accessTokenEncrypted) return false;
+
+      const accessToken = decryptToken(account.accessTokenEncrypted);
+      const response = await fetch(`${env.WHATSAPP_SERVICE_URL}/w_api/v1/whatsapp/send`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Service-Key': env.INTERNAL_SERVICE_SECRET,
+        },
+        body: JSON.stringify({
+          phoneNumberId: account.phoneNumberId,
+          accessToken,
+          to: params.recipientPhone,
+          type: 'text',
+          text: params.content,
+        }),
+      });
+      const resData = await response.json().catch(() => ({}));
+      if (!response.ok || resData?.success === false) {
+        console.error('[AI Receptionist] WhatsApp send failed:', response.status);
+        return false;
+      }
+
+      const providerId = resData?.data?.messages?.[0]?.id;
+      await prisma.message.update({
+        where: { id: params.messageId },
+        data: {
+          status: 'DELIVERED',
+          ...(providerId ? { providerMessageId: providerId } : {}),
+        },
+      });
+      return true;
+    } catch (err: any) {
+      console.error('[AI Receptionist] WhatsApp send failed:', err?.message || err);
+      return false;
+    }
   }
 
   async simulatePatientMessage(clinicId: string, conversationId: string, content: string) {

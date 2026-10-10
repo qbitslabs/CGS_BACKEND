@@ -56,3 +56,31 @@ export function clinicDayBoundsUtc(
 export function clinicCalendarUtcDate(dateStr: string): Date {
   return new Date(`${dateStr.split('T')[0]}T00:00:00.000Z`);
 }
+
+function clockLabelToMinutes(label: string): number | null {
+  const match = label.trim().match(/(\d{1,2}):(\d{2})\s*(AM|PM)/i);
+  if (!match) return null;
+  let hour = parseInt(match[1], 10);
+  const minute = parseInt(match[2], 10);
+  const period = match[3].toUpperCase();
+  if (period === 'PM' && hour < 12) hour += 12;
+  if (period === 'AM' && hour === 12) hour = 0;
+  return hour * 60 + minute;
+}
+
+/** On today's clinic date, drop slot labels that have already started. */
+export function dropPastSlots(
+  slots: string[],
+  dateStr: string,
+  timeZone: string = DEFAULT_CLINIC_TIMEZONE,
+  now: Date = new Date()
+): string[] {
+  const day = dateStr.split('T')[0];
+  if (day !== clinicDateString(now, timeZone)) return slots;
+  const nowMinutes = clockLabelToMinutes(clinicTimeString(now, timeZone));
+  if (nowMinutes == null) return slots;
+  return slots.filter((slot) => {
+    const minutes = clockLabelToMinutes(slot);
+    return minutes != null && minutes > nowMinutes;
+  });
+}

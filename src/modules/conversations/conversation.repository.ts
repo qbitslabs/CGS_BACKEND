@@ -282,22 +282,6 @@ export class ConversationRepository {
           },
         });
 
-        if (params.recipientPhone) {
-          await tx.job.create({
-            data: {
-              clinicId: params.clinicId,
-              queue: 'WHATSAPP',
-              type: 'WHATSAPP_SEND',
-              payload: {
-                messageId: message.id,
-                conversationId: params.conversationId,
-                recipientPhone: params.recipientPhone,
-                content: params.content,
-              },
-            },
-          });
-        }
-
         return message;
       },
       { maxWait: 10_000, timeout: 15_000 }

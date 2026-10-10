@@ -17,6 +17,14 @@ import { prisma } from '../../config/db.js';
 import { conversationService } from '../conversations/conversation.service.js';
 import { decryptToken } from '../../utils/crypto.js';
 import { env } from '../../config/env.js';
+import {
+  clinicCalendarUtcDate,
+  clinicDayBoundsUtc,
+  clinicTimeString,
+  clinicWeekday,
+  dropPastSlots,
+  resolveClinicTimezone,
+} from '../../utils/timezone.js';
 
 function formatDoctorName(firstName?: string | null, lastName?: string | null) {
   const full = `${firstName || ''} ${lastName || ''}`.trim();
@@ -166,7 +174,8 @@ export class InternalService {
       data: dto,
     });
 
-    await this.markInboundSeen(account.phoneNumberId, account.accessTokenEncrypted, dto.providerMessageId);
+    // Blue tick must not hold up the reply. The read call swallows its own errors.
+    void this.markInboundSeen(account.phoneNumberId, account.accessTokenEncrypted, dto.providerMessageId);
 
     // Meta / gateway retries reuse the same providerMessageId — do not run AI twice
     if (!persisted.isNew) {
@@ -337,9 +346,14 @@ export class InternalService {
     date: string,
     excludeAppointmentId?: string
   ) {
-    const parsedDate = new Date(`${date}T00:00:00.000Z`);
-    const startOfDay = new Date(`${date}T00:00:00.000Z`);
-    const endOfDay = new Date(`${date}T23:59:59.999Z`);
+    const dateKey = date.split('T')[0];
+    const clinic = await prisma.clinic.findUnique({
+      where: { id: clinicId },
+      select: { timezone: true },
+    });
+    const timeZone = resolveClinicTimezone(clinic?.timezone);
+    const parsedDate = clinicCalendarUtcDate(dateKey);
+    const { start: startOfDay, end: endOfDay } = clinicDayBoundsUtc(dateKey, timeZone);
 
     let resolvedDoctorId = doctorId;
     if (!resolvedDoctorId) {
@@ -371,8 +385,7 @@ export class InternalService {
       };
     }
 
-    const dayNames = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
-    const dayOfWeek = dayNames[parsedDate.getUTCDay()];
+    const dayOfWeek = clinicWeekday(startOfDay, timeZone);
     const workingDays = doctor.availabilityDays || [];
     const hoursStr = doctor.availabilityHours || null;
 
@@ -419,14 +432,14 @@ export class InternalService {
     const capacity = Math.min(20, Math.max(1, (doctor as { maxBookingsPerSlot?: number }).maxBookingsPerSlot || 1));
     const bookedCountBySlot = new Map<string, number>();
     for (const row of bookedAppointments) {
-      const label = new Date(row.startsAt).toLocaleTimeString('en-US', {
-        hour: '2-digit',
-        minute: '2-digit',
-        hour12: true,
-      });
+      const label = clinicTimeString(new Date(row.startsAt), timeZone);
       bookedCountBySlot.set(label, (bookedCountBySlot.get(label) || 0) + 1);
     }
-    const availableSlots = standardSlots.filter((slot) => (bookedCountBySlot.get(slot) || 0) < capacity);
+    const availableSlots = dropPastSlots(
+      standardSlots.filter((slot) => (bookedCountBySlot.get(slot) || 0) < capacity),
+      dateKey,
+      timeZone
+    );
 
     return {
       date,

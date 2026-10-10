@@ -3,6 +3,9 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 vi.mock('../../config/db.js', () => ({
   prisma: {
     entityAiConfig: { findFirst: vi.fn(async () => null) },
+    whatsAppAccount: { findFirst: vi.fn(async () => null) },
+    message: { update: vi.fn() },
+    job: { create: vi.fn(async () => ({ id: 'wa-retry' })) },
   },
 }));
 
@@ -54,7 +57,7 @@ describe('AI reply queue', () => {
     service.scheduleGenerateReply('clinic-1', 'conv-1', 'hello');
     service.scheduleGenerateReply('clinic-1', 'conv-1', 'hello');
     service.scheduleGenerateReply('clinic-1', 'conv-1', 'need a slot');
-    await vi.advanceTimersByTimeAsync(1600);
+    await vi.advanceTimersByTimeAsync(400);
 
     expect(enqueueAiReply).toHaveBeenCalledTimes(1);
     expect(enqueueAiReply).toHaveBeenCalledWith({
