@@ -6,6 +6,13 @@ import { clinicDayBoundsUtc } from '../../utils/timezone.js';
 import { Prisma } from '@prisma/client';
 
 export class BillingRepository {
+  async findDoctorInClinic(doctorId: string, clinicId: string) {
+    return prisma.doctor.findFirst({
+      where: { id: doctorId, clinicId },
+      select: { id: true },
+    });
+  }
+
   async getRevenueSummary(clinicId: string, doctorId?: string) {
     const invoiceScope = doctorId
       ? {

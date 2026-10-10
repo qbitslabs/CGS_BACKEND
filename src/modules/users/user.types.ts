@@ -30,5 +30,6 @@ export interface UserResponseDTO {
     consultationFee?: any;
     availabilityDays?: string[];
     availabilityHours?: string | null;
+    maxBookingsPerSlot?: number | null;
   };
 }

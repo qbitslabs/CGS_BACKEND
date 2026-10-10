@@ -29,6 +29,7 @@ export const updateUserSchema = z.object({
   consultationFee: z.coerce.number().optional(),
   availabilityDays: z.array(z.string()).optional(),
   availabilityHours: z.string().optional(),
+  maxBookingsPerSlot: z.coerce.number().int().min(1).max(20).optional(),
   isActive: z.boolean().optional(),
 });
 

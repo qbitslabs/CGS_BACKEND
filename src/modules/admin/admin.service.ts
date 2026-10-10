@@ -17,6 +17,70 @@ import { env } from '../../config/env.js';
 import { logAuditEvent } from '../../middleware/audit.js';
 import { auditService } from '../audit/audit.service.js';
 import { assertClinicSeatAvailable } from '../../utils/subscriptionSeats.js';
+import { encryptToken } from '../../utils/crypto.js';
+import { queueTemplateSends } from '../whatsapp/outbound.service.js';
+
+function jobText(value: unknown): string | undefined {
+  if (value === undefined || value === null || value === '') return undefined;
+  if (typeof value === 'string') return value.trim() || undefined;
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  if (Array.isArray(value)) {
+    const parts = value
+      .filter((item) => typeof item === 'string' || typeof item === 'number')
+      .map(String);
+    return parts.length ? parts.join(' · ') : undefined;
+  }
+  return undefined;
+}
+
+function pushJobDetail(rows: Array<{ label: string; value: string }>, label: string, value: unknown) {
+  const text = jobText(value);
+  if (!text) return;
+  rows.push({ label, value: text.length > 280 ? `${text.slice(0, 277)}...` : text });
+}
+
+/** Readable lines for the admin job popup. Secrets and raw ids stay out. */
+function describeJob(type: string, payload: unknown): Array<{ label: string; value: string }> {
+  const source =
+    payload && typeof payload === 'object' && !Array.isArray(payload)
+      ? (payload as Record<string, unknown>)
+      : {};
+  const rows: Array<{ label: string; value: string }> = [];
+
+  if (type === 'OUTBOUND_REMINDER_SCAN') {
+    pushJobDetail(rows, 'Summary', source.note);
+    pushJobDetail(rows, 'Visits checked', source.checked);
+    pushJobDetail(rows, 'Messages queued', source.queued);
+    pushJobDetail(rows, 'Last check', source.previousRanAt);
+  } else if (type === 'OUTBOUND_OUTCOME_SCAN') {
+    pushJobDetail(rows, 'Summary', source.note);
+    pushJobDetail(rows, 'Missed visits', source.missed);
+    pushJobDetail(rows, 'Completed visits', source.completed);
+    pushJobDetail(rows, 'Messages queued', source.queued);
+    pushJobDetail(rows, 'Last check', source.previousRanAt);
+  } else if (type === 'WHATSAPP_TEMPLATE_SEND') {
+    pushJobDetail(rows, 'Template', source.templateName || source.templateKey);
+    pushJobDetail(rows, 'Phone', source.recipientPhone);
+    pushJobDetail(rows, 'Message', source.sessionText);
+    pushJobDetail(rows, 'Invoice', source.invoiceId);
+    pushJobDetail(rows, 'Parameters', source.parameters);
+  } else if (type === 'WHATSAPP_SEND') {
+    pushJobDetail(rows, 'Phone', source.recipientPhone);
+    pushJobDetail(rows, 'Message', source.content);
+  } else if (type === 'AI_GENERATE_REPLY') {
+    pushJobDetail(rows, 'Patient message', source.userText);
+    pushJobDetail(rows, 'Conversation', source.conversationId);
+  } else {
+    const hidden = /token|password|secret|authorization|document/i;
+    for (const [key, value] of Object.entries(source)) {
+      if (hidden.test(key)) continue;
+      const label = key.replace(/([A-Z])/g, ' $1').replace(/^./, (char) => char.toUpperCase());
+      pushJobDetail(rows, label, value);
+    }
+  }
+
+  return rows;
+}
 
 const ADMIN_ROLE_PERMISSIONS: Record<string, string[]> = {
   SUPER_ADMIN: [
@@ -414,6 +478,28 @@ export class AdminService {
     return this.getClinicById(id);
   }
 
+  async replaceWhatsAppToken(id: string, accessToken: string, admin: { adminId: string; email: string }) {
+    const clinic = await this.repo.findClinicById(id);
+    if (!clinic) {
+      throw new AppError('Clinic not found', 404, 'NOT_FOUND');
+    }
+    const updated = await this.repo.replaceWhatsAppAccessToken(id, encryptToken(accessToken.trim()));
+    if (!updated) {
+      throw new AppError('WhatsApp account is not configured for this clinic', 409, 'WHATSAPP_NOT_CONFIGURED');
+    }
+    await logAuditEvent({
+      clinicId: id,
+      actorId: admin.adminId,
+      actorEmail: admin.email,
+      actorType: 'ADMIN',
+      action: 'WHATSAPP_TOKEN_REPLACED',
+      resourceType: 'WHATSAPP_ACCOUNT',
+      resourceId: updated.id,
+      metadata: { tokenReplaced: true },
+    });
+    return { saved: true };
+  }
+
   async createClinic(
     payload: {
       name: string;
@@ -461,10 +547,6 @@ export class AdminService {
         greetingMessage?: string;
         conversationInstructions?: string;
         clinicInformation?: string;
-        servicesTreatments?: string;
-        doctorsInfo?: string;
-        consultationDetails?: string;
-        timings?: string;
         faqs?: string;
         isAiEnabled?: boolean;
       };
@@ -544,10 +626,6 @@ export class AdminService {
     const ai = payload.ai || {};
     const knowledgeParts = [
       ai.clinicInformation && `Clinic Information:\n${ai.clinicInformation}`,
-      ai.servicesTreatments && `Services & Treatments:\n${ai.servicesTreatments}`,
-      ai.doctorsInfo && `Doctors:\n${ai.doctorsInfo}`,
-      ai.consultationDetails && `Consultation Details:\n${ai.consultationDetails}`,
-      ai.timings && `Timings:\n${ai.timings}`,
       ai.faqs && `FAQs:\n${ai.faqs}`,
     ].filter(Boolean);
 
@@ -576,10 +654,6 @@ export class AdminService {
         greetingMessage: ai.greetingMessage,
         conversationInstructions: ai.conversationInstructions,
         clinicInformation: ai.clinicInformation || '',
-        servicesTreatments: ai.servicesTreatments || '',
-        doctorsInfo: ai.doctorsInfo || '',
-        consultationDetails: ai.consultationDetails || '',
-        timings: ai.timings || '',
         faqs: ai.faqs || '',
       },
     });
@@ -720,7 +794,7 @@ export class AdminService {
 
   /**
    * Public landing form → resolve clinic by landingPageId → create/update lead,
-   * match preferred doctor, open AI WhatsApp conversation + outbound greeting job.
+   * match preferred doctor, open the conversation, and queue the landing enquiry template.
    */
   async submitPublicLandingEnquiry(
     landingPageId: string,
@@ -804,6 +878,7 @@ export class AdminService {
             source: 'WEBSITE',
             status: 'NEW',
             intent: 'HIGH',
+            score: 85,
             interestedService: service,
             preferredDoctor,
             howHeardAboutDoctor: howYouFindUs,
@@ -827,6 +902,8 @@ export class AdminService {
             name: patientName,
             email: payload.email?.trim() || lead.email,
             source: 'WEBSITE',
+            intent: 'HIGH',
+            score: Math.max(lead.score ?? 50, 85),
             interestedService: service,
             preferredDoctor,
             howHeardAboutDoctor: howYouFindUs,
@@ -883,52 +960,33 @@ export class AdminService {
         });
       }
 
-      const message = await tx.message.create({
+      await tx.notification.create({
         data: {
           clinicId: clinic.id,
-          conversationId: conversation.id,
-          whatsappAccountId: waAccount?.id,
-          direction: 'OUTBOUND',
-          senderType: 'AI',
-          senderName: 'CGS AI Receptionist',
-          content: greeting,
-          status: 'SENT',
-          isAiGenerated: true,
-        },
-      });
-
-      await tx.conversation.update({
-        where: { id: conversation.id },
-        data: {
-          lastMessageText: greeting,
-          lastMessageAt: new Date(),
-          lastActivityAt: new Date(),
-        },
-      });
-
-      await tx.job.create({
-        data: {
-          clinicId: clinic.id,
-          queue: 'WHATSAPP',
-          type: 'WHATSAPP_SEND',
-          payload: {
-            messageId: message.id,
-            conversationId: conversation.id,
-            recipientPhone: phone,
-            content: greeting,
-          },
+          type: 'NEW_LEAD',
+          title: `New enquiry from ${patientName}`,
+          message: `${service}${preferredDoctor ? ` with ${preferredDoctor}` : ''}`,
+          link: `/leads/${lead.id}`,
+          entityId: lead.id,
         },
       });
 
       return {
         leadId: lead.id,
         conversationId: conversation.id,
-        messageId: message.id,
         doctorId: matchedDoctor?.id || null,
-        greeting,
-        whatsappQueued: true,
       };
     });
+
+    let whatsappQueued = false;
+    try {
+      const queued = await queueTemplateSends(clinic.id, 'LANDING_ENQUIRY', {
+        leadIds: [result.leadId],
+      });
+      whatsappQueued = queued.queued.length > 0;
+    } catch (err: any) {
+      console.warn('[Landing] enquiry WhatsApp was not queued:', err?.message || err);
+    }
 
     await logAuditEvent({
       clinicId: clinic.id,
@@ -953,6 +1011,8 @@ export class AdminService {
       clinicName: clinic.name,
       preferredDoctor,
       service,
+      greeting,
+      whatsappQueued,
     };
   }
 
@@ -1651,6 +1711,7 @@ export class AdminService {
   }
 
   private mapJob(j: any) {
+    const details = describeJob(j.type, j.payload);
     return {
       id: j.id,
       queue: j.queue || 'DEFAULT',
@@ -1665,6 +1726,9 @@ export class AdminService {
       failureReason: j.lastError || undefined,
       clinicId: j.clinicId || undefined,
       clinicName: j.clinic?.name,
+      availableAt: j.availableAt,
+      note: typeof j.payload?.note === 'string' ? j.payload.note : undefined,
+      details,
     };
   }
 

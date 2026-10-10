@@ -242,6 +242,19 @@ export class AdminRepository {
     });
   }
 
+  async replaceWhatsAppAccessToken(clinicId: string, accessTokenEncrypted: string) {
+    const account = await prisma.whatsappAccount.findFirst({
+      where: { clinicId, isActive: true },
+      select: { id: true },
+    });
+    if (!account) return null;
+    return prisma.whatsappAccount.update({
+      where: { id: account.id },
+      data: { accessTokenEncrypted },
+      select: { id: true },
+    });
+  }
+
   async createClinic(data: {
     name: string;
     slug: string;

@@ -3,6 +3,7 @@
 import { prisma } from '../../config/db.js';
 import { AppointmentListQuery } from './appointment.types.js';
 import { clinicDayBoundsUtc } from '../../utils/timezone.js';
+import { assertDoctorSlotAvailable, isSlotConflictError } from '../../utils/appointmentSlot.js';
 
 export class AppointmentRepository {
   async findMany(query: AppointmentListQuery) {
@@ -89,22 +90,12 @@ export class AppointmentRepository {
       }
 
       if (validDoctorId) {
-        const collision = await tx.appointment.findFirst({
-          where: {
-            clinicId: params.clinicId,
-            doctorId: validDoctorId,
-            status: { notIn: ['CANCELLED', 'NO_SHOW'] },
-            OR: [
-              { startsAt: { gte: params.startsAt, lt: params.endsAt } },
-              { endsAt: { gt: params.startsAt, lte: params.endsAt } },
-              { AND: [{ startsAt: { lte: params.startsAt } }, { endsAt: { gte: params.endsAt } }] },
-            ],
-          },
+        await assertDoctorSlotAvailable(tx, {
+          clinicId: params.clinicId,
+          doctorId: validDoctorId,
+          startsAt: params.startsAt,
+          endsAt: params.endsAt,
         });
-
-        if (collision) {
-          throw new Error('SLOT_ALREADY_BOOKED');
-        }
       }
 
       const created = await tx.appointment.create({
@@ -119,6 +110,9 @@ export class AppointmentRepository {
           notes: params.notes,
           createdByUserId: params.createdByUserId,
         },
+      }).catch((err: unknown) => {
+        if (isSlotConflictError(err)) throw new Error('SLOT_ALREADY_BOOKED');
+        throw err;
       });
 
       if (params.serviceIds && params.serviceIds.length > 0) {

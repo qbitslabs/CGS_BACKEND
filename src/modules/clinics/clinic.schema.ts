@@ -24,10 +24,6 @@ export const updateClinicSchema = z.object({
       humanHandoffKeywords: z.array(z.string()).optional(),
       conversationInstructions: z.string().optional(),
       clinicInformation: z.string().optional(),
-      servicesTreatments: z.string().optional(),
-      doctorsInfo: z.string().optional(),
-      consultationDetails: z.string().optional(),
-      timings: z.string().optional(),
       faqs: z.string().optional(),
       metadata: z.record(z.any()).optional(),
     })

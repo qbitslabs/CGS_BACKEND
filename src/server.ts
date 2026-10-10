@@ -3,7 +3,7 @@
 import { createApp } from './app.js';
 import { env } from './config/env.js';
 import { disconnectPrisma } from './config/db.js';
-import { startJobWorker } from './workers/job.worker.js';
+import { startJobWorker, stopJobWorker } from './workers/job.worker.js';
 
 const app = createApp();
 
@@ -34,16 +34,20 @@ server.on('error', (err: NodeJS.ErrnoException) => {
 
 const gracefulShutdown = (signal: string) => {
   console.log(`\n[Server] Received ${signal}. Starting graceful shutdown...`);
-  server.close(async () => {
-    try {
-      await disconnectPrisma();
-      console.log('[Server] Prisma disconnected.');
-    } catch (err) {
-      console.error('[Server] Prisma disconnect error:', err);
-    }
-    console.log('[Server] HTTP server closed.');
-    process.exit(0);
-  });
+  void stopJobWorker()
+    .catch((err) => console.error('[Server] Worker shutdown error:', err))
+    .finally(() => {
+      server.close(async () => {
+        try {
+          await disconnectPrisma();
+          console.log('[Server] Prisma disconnected.');
+        } catch (err) {
+          console.error('[Server] Prisma disconnect error:', err);
+        }
+        console.log('[Server] HTTP server closed.');
+        process.exit(0);
+      });
+    });
   // Force-exit if close hangs (hot-reload / stuck sockets)
   setTimeout(() => process.exit(1), 8000).unref();
 };

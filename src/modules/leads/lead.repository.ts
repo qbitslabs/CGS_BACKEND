@@ -3,6 +3,13 @@
 import { prisma } from '../../config/db.js';
 import { CreateLeadDTO, LeadListQuery, UpdateLeadDTO } from './lead.types.js';
 
+export function scoreForIntent(intent?: string | null): number {
+  const key = String(intent || 'MEDIUM').toUpperCase();
+  if (key === 'HIGH') return 85;
+  if (key === 'LOW') return 40;
+  return 65;
+}
+
 export class LeadRepository {
   async count(query: LeadListQuery) {
     const where = this.buildWhere(query);
@@ -66,6 +73,7 @@ export class LeadRepository {
           preferredDoctor: data.preferredDoctor,
           howHeardAboutDoctor: data.howHeardAboutDoctor,
           intent: data.intent || 'MEDIUM',
+          score: data.score ?? scoreForIntent(data.intent),
           notes: data.notes,
           assignedToUserId: data.assignedToUserId,
         },

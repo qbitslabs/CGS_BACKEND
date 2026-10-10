@@ -118,10 +118,6 @@ export const createClinicAdminSchema = z.object({
       greetingMessage: z.string().optional(),
       conversationInstructions: z.string().optional(),
       clinicInformation: z.string().optional(),
-      servicesTreatments: z.string().optional(),
-      doctorsInfo: z.string().optional(),
-      consultationDetails: z.string().optional(),
-      timings: z.string().optional(),
       faqs: z.string().optional(),
       isAiEnabled: z.boolean().optional(),
     })
@@ -159,6 +155,10 @@ export const createClinicAdminSchema = z.object({
       })
     )
     .optional(),
+});
+
+export const replaceWhatsAppTokenSchema = z.object({
+  accessToken: z.string().min(20, 'Paste the WhatsApp access token from Meta'),
 });
 
 export const updateClinicAdminSchema = z.object({

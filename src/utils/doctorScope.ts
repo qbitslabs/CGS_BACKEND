@@ -70,7 +70,9 @@ export function doctorOwnedConversationWhere(scope: DoctorScope) {
   return {
     OR: [
       { doctorId: scope.restrictToDoctorId },
+      { doctorId: null },
       { patient: { appointments: { some: { doctorId: scope.restrictToDoctorId } } } },
+      { patient: { invoices: { some: { treatingDoctorId: scope.restrictToDoctorId } } } },
     ],
   };
 }

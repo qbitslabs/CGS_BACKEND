@@ -112,21 +112,6 @@ export class AppointmentService {
       }
     }
 
-    const collision = await this.repo.checkDoctorCollision(
-      clinicId,
-      resolvedDoctorId,
-      startTime,
-      endTime,
-      excludeAppointmentId
-    );
-    if (collision) {
-      throw new AppError(
-        'Selected doctor already has an appointment during this time window.',
-        409,
-        'SLOT_ALREADY_BOOKED'
-      );
-    }
-
     return { resolvedDoctorId, doctorRecord };
   }
 
@@ -273,6 +258,9 @@ export class AppointmentService {
           409,
           'SLOT_ALREADY_BOOKED'
         );
+      }
+      if (err.message === 'DOCTOR_NOT_IN_CLINIC') {
+        throw new AppError('Doctor does not belong to this clinic.', 404, 'DOCTOR_NOT_FOUND');
       }
       throw err;
     }
@@ -553,7 +541,7 @@ export class AppointmentService {
     const appointmentWhere: any = {
       clinicId,
       startsAt: { gte: startOfDay, lte: endOfDay },
-      status: { notIn: ['CANCELLED'] },
+      status: { notIn: ['CANCELLED', 'NO_SHOW'] },
     };
     if (resolvedDoctorId) {
       appointmentWhere.doctorId = resolvedDoctorId;
@@ -565,10 +553,14 @@ export class AppointmentService {
       select: { startsAt: true },
     });
 
-    const bookedSlots = bookedAppointments.map((a) => clinicTimeString(new Date(a.startsAt), timeZone));
-
-    // Slots where someone already booked the spot will not appear!
-    const availableSlots = allSlots.filter((slot) => !bookedSlots.includes(slot));
+    const capacity = Math.min(20, Math.max(1, doctor?.maxBookingsPerSlot || 1));
+    const bookedCountBySlot = new Map<string, number>();
+    for (const row of bookedAppointments) {
+      const label = clinicTimeString(new Date(row.startsAt), timeZone);
+      bookedCountBySlot.set(label, (bookedCountBySlot.get(label) || 0) + 1);
+    }
+    const bookedSlots = [...bookedCountBySlot.entries()].filter(([, count]) => count >= capacity).map(([label]) => label);
+    const availableSlots = allSlots.filter((slot) => (bookedCountBySlot.get(slot) || 0) < capacity);
 
     return {
       date: targetDate,

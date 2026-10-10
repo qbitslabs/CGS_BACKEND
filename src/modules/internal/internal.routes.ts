@@ -16,7 +16,6 @@ router.post('/whatsapp/inbound-message', internalController.handleWhatsAppInboun
 // Doctor-Centric AI Service Internal Endpoints
 router.post('/ai/context', internalController.getAiContext);
 router.post('/ai/patient', internalController.getAiPatient);
-router.post('/ai/lead', internalController.getOrUpsertLead);
 router.get('/ai/doctors', internalController.getAiDoctors);
 router.get('/ai/services', internalController.getAiServices);
 router.post('/ai/availability', internalController.getAvailability);

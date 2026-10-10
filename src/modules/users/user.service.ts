@@ -159,6 +159,7 @@ export class UserService {
     const hoursTouched =
       dto.availabilityDays !== undefined ||
       dto.availabilityHours !== undefined ||
+      dto.maxBookingsPerSlot !== undefined ||
       dto.specialization !== undefined ||
       dto.consultationFee !== undefined;
     if (hoursTouched) {
@@ -180,6 +181,7 @@ export class UserService {
             consultationFee: updated.doctor.consultationFee,
             availabilityDays: updated.doctor.availabilityDays,
             availabilityHours: updated.doctor.availabilityHours,
+            maxBookingsPerSlot: updated.doctor.maxBookingsPerSlot,
           }
         : undefined,
     } : null;

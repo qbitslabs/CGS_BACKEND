@@ -7,6 +7,7 @@ import morgan from 'morgan';
 import { env } from './config/env.js';
 import { requestTracing } from './middleware/audit.js';
 import { errorHandler } from './middleware/errorHandler.js';
+import { clientKey, rateLimit } from './middleware/rateLimit.js';
 
 // Route imports
 import authRoutes from './modules/auth/auth.routes.js';
@@ -25,9 +26,11 @@ import adminRoutes from './modules/admin/admin.routes.js';
 import { adminController } from './modules/admin/admin.controller.js';
 import aiRoutes from './modules/ai/ai.routes.js';
 import dashboardRoutes from './modules/dashboard/dashboard.routes.js';
+import whatsappOutboundRoutes from './modules/whatsapp/outbound.routes.js';
 
 export const createApp = (): express.Application => {
   const app = express();
+  app.set('trust proxy', 1);
 
   // Standard Security & Headers
   app.use(helmet());
@@ -94,10 +97,19 @@ export const createApp = (): express.Application => {
   app.use(`${prefix}/ai`, aiRoutes);
   app.use(`${prefix}/admin`, adminRoutes);
   app.use(`${prefix}/internal`, internalRoutes);
+  app.use(`${prefix}/whatsapp`, whatsappOutboundRoutes);
 
   // Public clinic landing — resolve clinic by landingPageId
   app.get(`${prefix}/public/landing/:landingPageId`, adminController.getPublicLanding);
-  app.post(`${prefix}/public/landing/:landingPageId/enquiry`, adminController.submitPublicLandingEnquiry);
+  app.post(
+    `${prefix}/public/landing/:landingPageId/enquiry`,
+    rateLimit({
+      windowMs: 10 * 60 * 1000,
+      max: 8,
+      key: (req) => clientKey(req, 'landing-enquiry'),
+    }),
+    adminController.submitPublicLandingEnquiry
+  );
 
   // Global Error Handler
   app.use(errorHandler);

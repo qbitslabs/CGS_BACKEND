@@ -1,13 +1,20 @@
 /* CGS auth module — business logic.
  * Clinic API layer for auth; talks Prisma or callers, not the AI database. */
 import bcrypt from 'bcryptjs';
-import jwt from 'jsonwebtoken';
 import { authRepository, AuthRepository } from './auth.repository.js';
 import { AuthResponseDTO, AuthUserProfileDTO, LoginDTO } from './auth.types.js';
-import { env } from '../../config/env.js';
 import { AppError } from '../../middleware/errorHandler.js';
 import { logAuditEvent } from '../../middleware/audit.js';
 import { resolveDoctorScope } from '../../utils/doctorScope.js';
+import { prisma } from '../../config/db.js';
+import {
+  createStaffSession,
+  revokeAllStaffSessions,
+  revokeSessionByRefreshToken,
+  revokeStaffSession,
+  rotateStaffSession,
+  signStaffAccessToken,
+} from './staffSession.js';
 
 export class AuthService {
   constructor(private readonly repo: AuthRepository = authRepository) {}
@@ -73,16 +80,20 @@ export class AuthService {
 
     await this.repo.updateLastLogin(user.id);
 
-    const tokenPayload = {
+    const name = `${user.firstName} ${user.lastName || ''}`.trim();
+    const session = await createStaffSession({
+      userId: user.id,
+      clinicId: user.clinicId,
+      userAgent: auditContext.userAgent,
+      ipAddress: auditContext.ip,
+    });
+    const accessToken = signStaffAccessToken({
       userId: user.id,
       clinicId: user.clinicId,
       role: user.role,
       email: user.email,
-      name: `${user.firstName} ${user.lastName || ''}`.trim(),
-    };
-
-    const accessToken = jwt.sign(tokenPayload, env.JWT_SECRET, {
-      expiresIn: env.JWT_EXPIRES_IN as any,
+      name,
+      sid: session.sessionId,
     });
 
     await logAuditEvent({
@@ -106,6 +117,7 @@ export class AuthService {
 
     return {
       accessToken,
+      refreshToken: session.refreshToken,
       user: {
         id: user.id,
         name: `${user.firstName} ${user.lastName || ''}`.trim(),
@@ -193,6 +205,63 @@ export class AuthService {
       seesAllClinicData: scope.seesAllClinicData,
       permissions,
     };
+  }
+
+  async refresh(
+    rawRefreshToken: string | null,
+    meta: { userAgent?: string; ipAddress?: string }
+  ): Promise<{ accessToken: string; refreshToken: string }> {
+    if (!rawRefreshToken) {
+      throw new AppError('Session expired. Please log in again.', 401, 'INVALID_REFRESH');
+    }
+
+    const rotated = await rotateStaffSession(rawRefreshToken, meta);
+    const user = await this.repo.findById(rotated.userId);
+    if (!user || user.status === 'DISABLED') {
+      await revokeAllStaffSessions(rotated.userId);
+      throw new AppError('Session expired. Please log in again.', 401, 'INVALID_REFRESH');
+    }
+
+    const accessToken = signStaffAccessToken({
+      userId: user.id,
+      clinicId: user.clinicId,
+      role: user.role,
+      email: user.email,
+      name: `${user.firstName} ${user.lastName || ''}`.trim(),
+      sid: rotated.sessionId,
+    });
+
+    return { accessToken, refreshToken: rotated.refreshToken };
+  }
+
+  async logout(input: { sessionId?: string; refreshToken: string | null }) {
+    if (input.sessionId) {
+      await revokeStaffSession(input.sessionId);
+    }
+    await revokeSessionByRefreshToken(input.refreshToken);
+  }
+
+  async changePassword(
+    userId: string,
+    currentPassword: string,
+    newPassword: string
+  ) {
+    const user = await this.repo.findById(userId);
+    if (!user || !user.passwordHash) {
+      throw new AppError('User not found', 404, 'NOT_FOUND');
+    }
+
+    const matches = await bcrypt.compare(currentPassword, user.passwordHash);
+    if (!matches) {
+      throw new AppError('Current password is incorrect', 401, 'INVALID_CREDENTIALS');
+    }
+
+    const passwordHash = await bcrypt.hash(newPassword, 10);
+    await prisma.user.update({
+      where: { id: userId },
+      data: { passwordHash },
+    });
+    await revokeAllStaffSessions(userId);
   }
 }
 

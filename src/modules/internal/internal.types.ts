@@ -27,15 +27,6 @@ export interface AIPatientQueryDTO {
   patientId?: string;
 }
 
-export interface AILeadUpsertDTO {
-  clinicId: string;
-  phone?: string;
-  leadId?: string;
-  name?: string;
-  interestedService?: string;
-  intent?: 'HIGH' | 'MEDIUM' | 'LOW';
-}
-
 export interface AIAvailabilityQueryDTO {
   clinicId: string;
   doctorId?: string;

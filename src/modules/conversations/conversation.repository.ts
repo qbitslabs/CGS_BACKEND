@@ -1,7 +1,16 @@
 /* CGS conversations module — Prisma queries.
  * Clinic API layer for conversations; talks Prisma or callers, not the AI database. */
 import { prisma } from '../../config/db.js';
+import { AI_GENERATE_REPLY_JOB } from '../../workers/jobClaim.js';
 import { ConversationListQuery, UpdateConversationDTO } from './conversation.types.js';
+
+function appendAiReplyText(previous: string, next: string): string {
+  const left = previous.trim();
+  const right = next.trim();
+  if (!left) return right;
+  if (!right || left === right || left.endsWith(`\n${right}`)) return left;
+  return `${left}\n${right}`;
+}
 
 export class ConversationRepository {
   async findUnreadForBadge(clinicId: string, doctorId?: string) {
@@ -13,7 +22,9 @@ export class ConversationRepository {
           ? {
               OR: [
                 { doctorId },
+                { doctorId: null },
                 { patient: { appointments: { some: { doctorId } } } },
+                { patient: { invoices: { some: { treatingDoctorId: doctorId } } } },
               ],
             }
           : {}),
@@ -50,7 +61,9 @@ export class ConversationRepository {
         {
           OR: [
             { doctorId: query.doctorId },
+            { doctorId: null },
             { patient: { appointments: { some: { doctorId: query.doctorId } } } },
+            { patient: { invoices: { some: { treatingDoctorId: query.doctorId } } } },
           ],
         },
       ];
@@ -159,6 +172,48 @@ export class ConversationRepository {
       });
 
       return message;
+    });
+  }
+
+  /** One pending AI reply job per conversation. A later burst is folded into that job. */
+  async enqueueAiReply(params: { clinicId: string; conversationId: string; userText: string }) {
+    const userText = params.userText.trim();
+    if (!userText) return null;
+
+    const payload = {
+      clinicId: params.clinicId,
+      conversationId: params.conversationId,
+      userText,
+    };
+
+    const pending = await prisma.job.findFirst({
+      where: {
+        clinicId: params.clinicId,
+        type: AI_GENERATE_REPLY_JOB,
+        status: 'PENDING',
+        payload: { path: ['conversationId'], equals: params.conversationId },
+      },
+      orderBy: { createdAt: 'asc' },
+    });
+
+    if (pending) {
+      const previous = String((pending.payload as { userText?: string } | null)?.userText || '');
+      const merged = appendAiReplyText(previous, userText);
+      const updated = await prisma.job.updateMany({
+        where: { id: pending.id, status: 'PENDING' },
+        data: { payload: { ...payload, userText: merged } },
+      });
+      if (updated.count > 0) return pending;
+    }
+
+    return prisma.job.create({
+      data: {
+        clinicId: params.clinicId,
+        queue: 'AI',
+        type: AI_GENERATE_REPLY_JOB,
+        maxAttempts: 3,
+        payload,
+      },
     });
   }
 
@@ -290,20 +345,6 @@ export class ConversationRepository {
             user: { select: { firstName: true, lastName: true } },
           },
         },
-      },
-    });
-
-    await prisma.notification.create({
-      data: {
-        clinicId: params.clinicId,
-        type: 'HUMAN_HANDOFF',
-        title:
-          params.severity === 'critical'
-            ? `Critical Situation: ${updated.participantName}`
-            : `Human Handoff Required: ${updated.participantName}`,
-        message: handoffReason,
-        link: `/conversations`,
-        entityId: updated.id,
       },
     });
 

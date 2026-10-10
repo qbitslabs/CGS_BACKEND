@@ -11,6 +11,7 @@ import {
   createClinicAdminSchema,
   createClinicUserAdminSchema,
   updateClinicAdminSchema,
+  replaceWhatsAppTokenSchema,
   updateDoctorAiConfigSchema,
   publicLandingEnquirySchema,
   setPrimaryDoctorSchema,
@@ -247,6 +248,20 @@ export class AdminController {
       const { id } = req.params;
       const body = updateClinicAdminSchema.parse(req.body);
       const data = await this.service.updateClinicStatus(id, body.status || 'ACTIVE', body.reason, {
+        adminId: req.admin!.adminId,
+        email: req.admin!.email,
+      });
+      res.json({ success: true, data });
+    } catch (error) {
+      next(error);
+    }
+  };
+
+  replaceWhatsAppToken = async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
+    try {
+      const { id } = req.params;
+      const body = replaceWhatsAppTokenSchema.parse(req.body);
+      const data = await this.service.replaceWhatsAppToken(id, body.accessToken, {
         adminId: req.admin!.adminId,
         email: req.admin!.email,
       });

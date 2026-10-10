@@ -22,6 +22,7 @@ export const createLeadSchema = z.object({
   preferredDoctor: z.string().optional(),
   howHeardAboutDoctor: z.string().optional(),
   intent: z.enum(['HIGH', 'MEDIUM', 'LOW']).default('MEDIUM'),
+  score: z.number().int().min(0).max(100).optional(),
   notes: z.string().optional(),
   assignedToUserId: z.string().uuid().optional(),
 });

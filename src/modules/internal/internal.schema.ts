@@ -40,15 +40,6 @@ export const aiPatientSchema = z.object({
   patientId: optionalUuid,
 });
 
-export const aiLeadSchema = z.object({
-  clinicId: z.string().uuid(),
-  phone: optionalText,
-  leadId: optionalUuid,
-  name: optionalText,
-  interestedService: optionalText,
-  intent: z.enum(['HIGH', 'MEDIUM', 'LOW']).optional(),
-});
-
 export const aiAvailabilitySchema = z.object({
   clinicId: z.string().uuid(),
   doctorId: optionalUuid,

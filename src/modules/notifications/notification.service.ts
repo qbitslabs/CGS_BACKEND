@@ -15,14 +15,12 @@ export class NotificationService {
       type:
         n.type === 'NEW_LEAD'
           ? 'New Lead'
-          : n.type === 'NEW_CONVERSATION'
-          ? 'New Conversation'
-          : n.type === 'HUMAN_HANDOFF'
-          ? 'Human Handoff'
           : n.type === 'APPOINTMENT_REMINDER'
           ? 'Appointment Reminder'
           : n.type === 'APPOINTMENT_CHANGE'
           ? 'Appointment Change'
+          : n.title.startsWith('Invoice')
+          ? 'Invoice'
           : 'System Notification',
       title: n.title,
       message: n.message,

@@ -3,23 +3,10 @@
 import { billingRepository, BillingRepository } from './billing.repository.js';
 import { CollectPaymentDTO, CreateInvoiceDTO, InvoiceListQuery } from './billing.types.js';
 import { patientRepository } from '../patients/patient.repository.js';
-import { conversationRepository } from '../conversations/conversation.repository.js';
 import { AppError } from '../../middleware/errorHandler.js';
 import { logAuditEvent } from '../../middleware/audit.js';
-import { buildInvoicePdf, invoicePdfFilename } from './invoicePdf.js';
-
-function phoneMatchVariants(phone: string): string[] {
-  const digits = phone.replace(/\D/g, '');
-  if (!digits) return [];
-  const variants = new Set<string>([digits, phone]);
-  if (digits.length === 10) variants.add(`91${digits}`);
-  if (digits.startsWith('91') && digits.length === 12) variants.add(digits.slice(2));
-  if (digits.startsWith('0') && digits.length === 11) {
-    variants.add(digits.slice(1));
-    variants.add(`91${digits.slice(1)}`);
-  }
-  return [...variants];
-}
+import { queueTemplateSends } from '../whatsapp/outbound.service.js';
+import { prisma } from '../../config/db.js';
 
 function formatInvoiceDoctorName(user?: { firstName?: string | null; lastName?: string | null } | null) {
   if (!user) return undefined;
@@ -27,31 +14,6 @@ function formatInvoiceDoctorName(user?: { firstName?: string | null; lastName?: 
   if (!full) return undefined;
   if (/^dr\.?\s/i.test(full)) return full;
   return `Dr. ${full}`;
-}
-
-function whatsappRecipient(phone: string): string {
-  const digits = phone.replace(/\D/g, '');
-  if (digits.length === 10) return `91${digits}`;
-  return digits || phone;
-}
-
-function formatInvoiceWhatsAppText(inv: ReturnType<BillingService['mapInvoiceToDTO']>): string {
-  const clinic = inv.clinicName || 'the clinic';
-  const paidNote =
-    inv.paymentStatus === 'Paid'
-      ? `Paid in full (₹${Number(inv.total).toLocaleString('en-IN')} via ${inv.paymentMethod})`
-      : inv.remainingAmount > 0
-        ? `Amount due: ₹${Number(inv.remainingAmount).toLocaleString('en-IN')}`
-        : `Total: ₹${Number(inv.total).toLocaleString('en-IN')}`;
-
-  return [
-    `Hi ${inv.patientName}, thank you for visiting ${clinic}.`,
-    '',
-    `Your invoice ${inv.invoiceNumber} is attached as a PDF.`,
-    paidNote,
-    '',
-    'Please keep this for your records. Reply here if you have any questions.',
-  ].join('\n');
 }
 
 export class BillingService {
@@ -161,6 +123,13 @@ export class BillingService {
       throw new AppError('Patient not found.', 404, 'NOT_FOUND');
     }
 
+    if (dto.treatingDoctorId) {
+      const doctor = await this.repo.findDoctorInClinic(dto.treatingDoctorId, clinicId);
+      if (!doctor) {
+        throw new AppError('Doctor not found in this clinic.', 404, 'DOCTOR_NOT_FOUND');
+      }
+    }
+
     const subtotal = dto.items.reduce((acc, item) => acc + item.quantity * item.unitPrice, 0);
     const discount = dto.discount || 0;
     const taxPercent = dto.taxPercent || 0;
@@ -183,6 +152,21 @@ export class BillingService {
       paymentMethod: dto.paymentMethod,
       treatingDoctorId: dto.treatingDoctorId,
     });
+
+    try {
+      await prisma.notification.create({
+        data: {
+          clinicId,
+          type: 'SYSTEM_NOTIFICATION',
+          title: `Invoice ${invoice.invoiceNumber} generated`,
+          message: `${patient.name} · ₹${Math.round(total).toLocaleString('en-IN')}`,
+          link: '/billing',
+          entityId: invoice.id,
+        },
+      });
+    } catch (err: any) {
+      console.warn('[Billing] invoice notification failed:', err?.message || err);
+    }
 
     await logAuditEvent({
       clinicId,
@@ -288,11 +272,8 @@ export class BillingService {
     if (!invoice) {
       throw new AppError('Invoice not found.', 404, 'NOT_FOUND');
     }
-
-    const dto = this.mapInvoiceToDTO(invoice);
-    const rawPhone = dto.patientPhone || invoice.patient?.phone || '';
-    const phones = phoneMatchVariants(rawPhone);
-    if (!phones.length) {
+    const phone = String(invoice.patient?.phone || '').replace(/\D/g, '');
+    if (phone.length < 8) {
       throw new AppError(
         'This patient has no WhatsApp number on file.',
         400,
@@ -300,37 +281,19 @@ export class BillingService {
       );
     }
 
-    const recipientPhone = whatsappRecipient(rawPhone);
-    const content = formatInvoiceWhatsAppText(dto);
-    const filename = invoicePdfFilename(dto.invoiceNumber);
-    const pdf = await buildInvoicePdf(dto);
-    let conversation = await this.repo.findConversationForPatient(clinicId, dto.patientId, phones);
-
-    if (!conversation) {
-      const waAccount = await this.repo.findActiveWhatsappAccount(clinicId);
-      conversation = await this.repo.createConversationForPatient({
-        clinicId,
-        patientId: dto.patientId,
-        participantName: dto.patientName,
-        participantPhone: recipientPhone,
-        whatsappAccountId: waAccount?.id,
-        lastMessageText: content,
-      });
-    }
-
-    await conversationRepository.sendStaffMessageInTx({
-      clinicId,
-      conversationId: conversation.id,
-      senderName: auditContext.actorName || 'Clinic',
-      content,
-      mediaUrl: filename,
-      recipientPhone: conversation.participantPhone || recipientPhone,
-      document: {
-        filename,
-        mimeType: 'application/pdf',
-        base64: pdf.toString('base64'),
-      },
+    const senderDoctor = auditContext.userId
+      ? await prisma.doctor.findFirst({
+          where: { clinicId, userId: auditContext.userId },
+          select: { id: true },
+        })
+      : null;
+    const result = await queueTemplateSends(clinicId, 'BILL', {
+      invoiceIds: [invoiceId],
+      fallbackDoctorId: senderDoctor?.id,
     });
+    if (!result.queued.length) {
+      throw new AppError('This bill was already queued for WhatsApp today.', 409, 'DUPLICATE_SEND');
+    }
 
     await logAuditEvent({
       clinicId,
@@ -340,13 +303,17 @@ export class BillingService {
       action: 'INVOICE_WHATSAPP_SENT',
       resourceType: 'INVOICE',
       resourceId: invoiceId,
-      metadata: { invoiceNumber: dto.invoiceNumber, conversationId: conversation.id },
+      metadata: { invoiceNumber: invoice.invoiceNumber, conversationId: result.queued[0]?.conversationId },
       ipAddress: auditContext.ip,
       userAgent: auditContext.userAgent,
       requestId: auditContext.requestId,
     });
 
-    return { sent: true, invoiceNumber: dto.invoiceNumber, conversationId: conversation.id };
+    return {
+      sent: result.queued.length > 0,
+      invoiceNumber: invoice.invoiceNumber,
+      conversationId: result.queued[0]?.conversationId,
+    };
   }
 
   async getSubscription(clinicId: string) {

@@ -4,13 +4,10 @@ import { clinicRepository, ClinicRepository } from './clinic.repository.js';
 import { CreateClinicServiceDTO, UpdateClinicDTO } from './clinic.types.js';
 import { AppError } from '../../middleware/errorHandler.js';
 import { logAuditEvent } from '../../middleware/audit.js';
+import { aiClient } from '../ai/ai.client.js';
 
 const KNOWLEDGE_SECTION_KEYS = [
   { heading: 'Clinic Information', key: 'clinicInformation' },
-  { heading: 'Services & Treatments', key: 'servicesTreatments' },
-  { heading: 'Doctors', key: 'doctorsInfo' },
-  { heading: 'Consultation Details', key: 'consultationDetails' },
-  { heading: 'Timings', key: 'timings' },
   { heading: 'FAQs', key: 'faqs' },
 ] as const;
 
@@ -124,24 +121,6 @@ export class ClinicService {
 
     const meta = (clinic.aiConfig?.metadata as Record<string, any>) || {};
     const parsedKnowledge = parseKnowledgeFromSystemPrompt(clinic.aiConfig?.systemPrompt);
-    const servicesFallback = clinic.services.map((s) => s.name).filter(Boolean).join(', ');
-    const doctorsFallback = clinic.doctors
-      .map((d) => {
-        const name = `${d.user.firstName} ${d.user.lastName || ''}`.trim();
-        return d.specialization ? `${name} (${d.specialization})` : name;
-      })
-      .filter(Boolean)
-      .join('\n');
-    const timingsFallback =
-      clinic.workingHours ||
-      [
-        (clinic.workingDays || []).join(', '),
-        clinic.openingTime && clinic.closingTime
-          ? `${clinic.openingTime} - ${clinic.closingTime}`
-          : '',
-      ]
-        .filter(Boolean)
-        .join(' • ');
     const clinicInfoFallback = [
       clinic.name,
       clinic.description,
@@ -176,16 +155,6 @@ export class ClinicService {
             parsedKnowledge.clinicInformation ||
             clinicInfoFallback ||
             '',
-          servicesTreatments:
-            meta.servicesTreatments ||
-            parsedKnowledge.servicesTreatments ||
-            servicesFallback ||
-            '',
-          doctorsInfo:
-            meta.doctorsInfo || parsedKnowledge.doctorsInfo || doctorsFallback || '',
-          consultationDetails:
-            meta.consultationDetails || parsedKnowledge.consultationDetails || '',
-          timings: meta.timings || parsedKnowledge.timings || timingsFallback || '',
           faqs: meta.faqs || parsedKnowledge.faqs || '',
           metadata: meta,
         }
@@ -202,10 +171,6 @@ export class ClinicService {
           greetingMessage: 'Hello! How can I assist your health appointment today?',
           conversationInstructions: '',
           clinicInformation: clinicInfoFallback,
-          servicesTreatments: servicesFallback,
-          doctorsInfo: doctorsFallback,
-          consultationDetails: '',
-          timings: timingsFallback,
           faqs: '',
           metadata: {},
         };
@@ -246,6 +211,7 @@ export class ClinicService {
           days: d.availabilityDays,
           hours: d.availabilityHours || '09:00 AM - 07:00 PM',
         },
+        maxBookingsPerSlot: d.maxBookingsPerSlot || 1,
         isActive: d.isActive,
       })),
     };
@@ -273,10 +239,6 @@ export class ClinicService {
     if (aiConfigInput) {
       const knowledgeParts = [
         aiConfigInput.clinicInformation && `Clinic Information:\n${aiConfigInput.clinicInformation}`,
-        aiConfigInput.servicesTreatments && `Services & Treatments:\n${aiConfigInput.servicesTreatments}`,
-        aiConfigInput.doctorsInfo && `Doctors:\n${aiConfigInput.doctorsInfo}`,
-        aiConfigInput.consultationDetails && `Consultation Details:\n${aiConfigInput.consultationDetails}`,
-        aiConfigInput.timings && `Timings:\n${aiConfigInput.timings}`,
         aiConfigInput.faqs && `FAQs:\n${aiConfigInput.faqs}`,
       ].filter(Boolean);
 
@@ -317,15 +279,12 @@ export class ClinicService {
             greetingMessage: aiConfigInput.greetingMessage,
             conversationInstructions,
             clinicInformation: aiConfigInput.clinicInformation,
-            servicesTreatments: aiConfigInput.servicesTreatments,
-            doctorsInfo: aiConfigInput.doctorsInfo,
-            consultationDetails: aiConfigInput.consultationDetails,
-            timings: aiConfigInput.timings,
             faqs: aiConfigInput.faqs,
             ...(aiConfigInput.metadata || {}),
           }).filter(([, v]) => v !== undefined)
         ),
       });
+      void aiClient.invalidateClinicCache(clinicId);
     }
 
     await logAuditEvent({

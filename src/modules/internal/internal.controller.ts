@@ -9,7 +9,6 @@ import {
   aiRescheduleAppointmentSchema,
   aiContextSchema,
   aiHandoffSchema,
-  aiLeadSchema,
   aiPatientSchema,
   aiRecordUsageSchema,
   syncSummarySchema,
@@ -55,16 +54,6 @@ export class InternalController {
     try {
       const data = aiPatientSchema.parse(req.body);
       const result = await this.service.getAiPatient(data);
-      res.json({ success: true, data: result });
-    } catch (error) {
-      next(error);
-    }
-  };
-
-  getOrUpsertLead = async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
-    try {
-      const data = aiLeadSchema.parse(req.body);
-      const result = await this.service.getOrUpsertLead(data);
       res.json({ success: true, data: result });
     } catch (error) {
       next(error);

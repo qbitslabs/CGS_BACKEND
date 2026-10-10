@@ -3,31 +3,75 @@
 import { prisma } from '../../config/db.js';
 import {
   AIBookAppointmentDTO,
-  AILeadUpsertDTO,
   AIPatientQueryDTO,
   AIRecordUsageDTO,
   SyncSummaryDTO,
   WhatsAppInboundMessageDTO,
 } from './internal.types.js';
+import { assertDoctorSlotAvailable, isSlotConflictError } from '../../utils/appointmentSlot.js';
+import { phoneMatchVariants } from '../../utils/phoneMatch.js';
 
-/** Match landing (10-digit) vs WhatsApp (91…) and other common India formats. */
-function phoneMatchVariants(phone: string): string[] {
-  const digits = phone.replace(/\D/g, '');
-  if (!digits) return [phone];
+function usablePatientName(name?: string | null): string | null {
+  const raw = (name || '').trim();
+  if (!raw) return null;
+  if (['patient', 'user', 'unknown', 'whatsapp', 'contact', 'guest', 'there'].includes(raw.toLowerCase())) {
+    return null;
+  }
+  const letters = raw.replace(/[^\p{L}]/gu, '');
+  return letters.length > 3 ? raw : null;
+}
 
-  const variants = new Set<string>([digits]);
-  if (digits.length === 10) {
-    variants.add(`91${digits}`);
-  }
-  if (digits.startsWith('91') && digits.length === 12) {
-    variants.add(digits.slice(2));
-  }
-  if (digits.startsWith('0') && digits.length === 11) {
-    const withoutZero = digits.slice(1);
-    variants.add(withoutZero);
-    variants.add(`91${withoutZero}`);
-  }
-  return [...variants];
+const ENQUIRY_TEMPLATE = 'cgs_landing_enquiry';
+
+async function markContactedAfterEnquiryReply(clinicId: string, conversationId: string) {
+  const conversation = await prisma.conversation.findFirst({
+    where: { id: conversationId, clinicId },
+    select: { leadId: true },
+  });
+  if (!conversation?.leadId) return;
+
+  const enquirySent = await prisma.message.findFirst({
+    where: {
+      clinicId,
+      conversationId,
+      direction: 'OUTBOUND',
+      mediaType: ENQUIRY_TEMPLATE,
+    },
+    select: { id: true },
+  });
+  if (!enquirySent) return;
+
+  const lead = await prisma.lead.findFirst({
+    where: { id: conversation.leadId, clinicId, status: 'NEW' },
+    select: { id: true, score: true },
+  });
+  if (!lead) return;
+
+  const nextScore = Math.min(100, (lead.score ?? 50) + 10);
+  await prisma.lead.update({
+    where: { id: lead.id },
+    data: { status: 'CONTACTED', score: nextScore },
+  });
+  await prisma.leadActivity.create({
+    data: {
+      leadId: lead.id,
+      type: 'status_change',
+      title: 'Lead contacted',
+      description: `Replied to the website enquiry on WhatsApp. Score ${lead.score ?? 50} to ${nextScore}.`,
+      actor: 'WhatsApp',
+    },
+  });
+}
+
+export function pickInboundConversation<T extends { lastActivityAt?: Date | null; createdAt?: Date | null }>(
+  rows: T[]
+): T | null {
+  if (!rows.length) return null;
+  return [...rows].sort((left, right) => {
+    const leftAt = new Date(left.lastActivityAt || left.createdAt || 0).getTime();
+    const rightAt = new Date(right.lastActivityAt || right.createdAt || 0).getTime();
+    return rightAt - leftAt;
+  })[0];
 }
 
 export class InternalRepository {
@@ -65,7 +109,14 @@ export class InternalRepository {
     data: WhatsAppInboundMessageDTO;
   }) {
     // Keep this transaction short — long txs die on Supabase pooler (P2028).
-    const result = await prisma.$transaction(
+    let result: {
+      message: { id: string; conversationId: string };
+      conversationId: string;
+      displayName: string;
+      isNew: boolean;
+    };
+    try {
+      result = await prisma.$transaction(
       async (tx) => {
       const phoneVariants = phoneMatchVariants(params.data.senderPhone);
       const metaProfileName = params.data.senderName?.trim() || null;
@@ -79,17 +130,12 @@ export class InternalRepository {
           clinicId: params.clinicId,
           participantPhone: { in: phoneVariants },
         },
-        orderBy: { createdAt: 'desc' },
+        orderBy: { lastActivityAt: 'desc' },
         include: { lead: true },
         take: 10,
       });
 
-      let conversation =
-        conversations.find((c) => c.lead?.source === 'WEBSITE') ||
-        conversations.find((c) => c.internalNotes?.includes('Lead from landing page')) ||
-        conversations.find((c) => Boolean(c.leadId)) ||
-        conversations[0] ||
-        null;
+      let conversation = pickInboundConversation(conversations);
 
       let patient = await tx.patient.findFirst({
         where: {
@@ -164,6 +210,7 @@ export class InternalRepository {
             lastActivityAt: new Date(),
             patientId: patient?.id || conversation.patientId,
             leadId: lead?.id || conversation.leadId,
+            whatsappAccountId: params.accountId,
             participantPhone: canonicalPhone,
             // Force landing lead name onto the thread (fixes prior Meta-name duplicates).
             participantName: displayName,
@@ -211,22 +258,24 @@ export class InternalRepository {
         timeout: 20_000,
       }
     );
+    } catch (err: any) {
+      if (err?.code === 'P2002') {
+        const existing = await prisma.message.findUnique({
+          where: { providerMessageId: params.data.providerMessageId },
+        });
+        if (existing) {
+          return { message: existing, conversationId: existing.conversationId, isNew: false };
+        }
+      }
+      throw err;
+    }
 
     // Side effects outside the transaction — must not risk P2028 on the inbound commit
     if (result.isNew) {
       try {
-        await prisma.notification.create({
-          data: {
-            clinicId: params.clinicId,
-            type: 'NEW_CONVERSATION',
-            title: `New WhatsApp Message from ${result.displayName}`,
-            message: params.data.content.slice(0, 100),
-            link: `/conversations`,
-            entityId: result.conversationId,
-          },
-        });
+        await markContactedAfterEnquiryReply(params.clinicId, result.conversationId);
       } catch (err: any) {
-        console.warn('[Inbound] notification create failed:', err?.message || err);
+        console.warn('[Inbound] enquiry reply lead update failed:', err?.message || err);
       }
 
       try {
@@ -301,56 +350,6 @@ export class InternalRepository {
     });
   }
 
-  async getOrUpsertLead(dto: AILeadUpsertDTO) {
-    let lead: any = null;
-    if (dto.leadId) {
-      lead = await prisma.lead.findUnique({ where: { id: dto.leadId } });
-    } else if (dto.phone) {
-      const variants = phoneMatchVariants(dto.phone);
-      const leads = await prisma.lead.findMany({
-        where: { clinicId: dto.clinicId, phone: { in: variants } },
-        orderBy: { createdAt: 'desc' },
-        take: 10,
-      });
-      lead = leads.find((l) => l.source === 'WEBSITE') || leads[0] || null;
-    }
-
-    if (lead) {
-      // Never overwrite a landing/website lead name with WhatsApp/AI guess.
-      const keepLandingName = lead.source === 'WEBSITE' || Boolean(lead.name);
-      lead = await prisma.lead.update({
-        where: { id: lead.id },
-        data: {
-          name: keepLandingName ? lead.name : dto.name || lead.name,
-          interestedService: dto.interestedService || lead.interestedService,
-          intent: dto.intent || lead.intent,
-          phone: dto.phone
-            ? phoneMatchVariants(dto.phone).find((p) => p.startsWith('91') && p.length === 12) || lead.phone
-            : lead.phone,
-        },
-      });
-      return lead;
-    }
-
-    if (dto.phone) {
-      const canonical =
-        phoneMatchVariants(dto.phone).find((p) => p.startsWith('91') && p.length === 12) || dto.phone;
-      lead = await prisma.lead.create({
-        data: {
-          clinicId: dto.clinicId,
-          phone: canonical,
-          name: dto.name || 'WhatsApp Lead',
-          source: 'WHATSAPP',
-          interestedService: dto.interestedService || 'General Consultation',
-          intent: dto.intent || 'MEDIUM',
-          status: 'NEW',
-        },
-      });
-    }
-
-    return lead;
-  }
-
   async getDoctorLeavesForDay(clinicId: string, doctorId: string | undefined, date: Date) {
     const where: any = {
       clinicId,
@@ -381,7 +380,7 @@ export class InternalRepository {
     const where: any = {
       clinicId,
       startsAt: { gte: startOfDay, lte: endOfDay },
-      status: { notIn: ['CANCELLED'] },
+      status: { notIn: ['CANCELLED', 'NO_SHOW'] },
     };
     if (doctorId) where.doctorId = doctorId;
 
@@ -413,10 +412,21 @@ export class InternalRepository {
       });
       if (!existing) return null;
 
+      const doctorId = params.doctorId ?? existing.doctorId ?? undefined;
+      if (doctorId) {
+        await assertDoctorSlotAvailable(tx, {
+          clinicId: params.clinicId,
+          doctorId,
+          startsAt: params.startsAt,
+          endsAt: params.endsAt,
+          excludeAppointmentId: existing.id,
+        });
+      }
+
       const appointment = await tx.appointment.update({
         where: { id: existing.id },
         data: {
-          doctorId: params.doctorId ?? existing.doctorId,
+          doctorId: doctorId ?? existing.doctorId,
           startsAt: params.startsAt,
           endsAt: params.endsAt,
           durationMinutes: existing.durationMinutes || 30,
@@ -425,6 +435,9 @@ export class InternalRepository {
             ? `[Rescheduled by AI Assistant] ${params.notes}`
             : existing.notes,
         },
+      }).catch((err: unknown) => {
+        if (isSlotConflictError(err)) throw new Error('SLOT_ALREADY_BOOKED');
+        throw err;
       });
 
       const patientName = existing.patient?.name || 'Patient';
@@ -487,11 +500,23 @@ export class InternalRepository {
         orderBy: { createdAt: 'desc' },
         take: 10,
       });
-      const matchingLead =
+      const matchingLeadStart =
         matchingLeads.find((l) => l.source === 'WEBSITE') || matchingLeads[0] || null;
+      let matchingLead = matchingLeadStart;
 
-      // Prefer landing lead name over whatever the AI/Meta guessed.
-      const resolvedName = matchingLead?.name || params.patientName || 'Patient';
+      const incomingName = usablePatientName(params.patientName);
+      const leadNameOk = usablePatientName(matchingLead?.name);
+      if (matchingLead && incomingName && !leadNameOk) {
+        matchingLead = await tx.lead.update({
+          where: { id: matchingLead.id },
+          data: { name: incomingName },
+        });
+      }
+      // A landing-page name that is already long enough stays. A short webhook name does not.
+      const resolvedName =
+        leadNameOk && matchingLead
+          ? matchingLead.name
+          : incomingName || matchingLead?.name || params.patientName || 'Patient';
 
       const clinicalNoteParts = [
         params.medicalHistoryNotes?.trim(),
@@ -551,7 +576,11 @@ export class InternalRepository {
         patient = await tx.patient.update({
           where: { id: patient.id },
           data: {
-            name: matchingLead?.name || patient.name || resolvedName,
+            name: (() => {
+              if (leadNameOk && matchingLead) return matchingLead.name;
+              if (usablePatientName(patient.name)) return patient.name;
+              return incomingName || patient.name || resolvedName;
+            })(),
             phone: canonicalPhone,
             age: params.age ?? patient.age,
             gender:
@@ -585,6 +614,15 @@ export class InternalRepository {
         }
       }
 
+      if (params.doctorId) {
+        await assertDoctorSlotAvailable(tx, {
+          clinicId: params.clinicId,
+          doctorId: params.doctorId,
+          startsAt: params.startsAt,
+          endsAt: params.endsAt,
+        });
+      }
+
       const appointment = await tx.appointment.create({
         data: {
           clinicId: params.clinicId,
@@ -597,6 +635,9 @@ export class InternalRepository {
           durationMinutes: 30,
           notes: params.notes ? `[Booked by AI Assistant] ${params.notes}` : '[Booked by AI Assistant]',
         },
+      }).catch((err: unknown) => {
+        if (isSlotConflictError(err)) throw new Error('SLOT_ALREADY_BOOKED');
+        throw err;
       });
 
       if (matchingLead) {
@@ -628,6 +669,7 @@ export class InternalRepository {
         data: {
           patientId: patient.id,
           leadId: matchingLead?.id,
+          ...(incomingName && !leadNameOk ? { participantName: incomingName } : {}),
         },
       });
 
@@ -818,20 +860,6 @@ export class InternalRepository {
           state: 'HANDOFF_PENDING',
           handoffReason,
           lastActivityAt: new Date(),
-        },
-      });
-
-      await tx.notification.create({
-        data: {
-          clinicId: params.clinicId,
-          type: 'HUMAN_HANDOFF',
-          title:
-            params.severity === 'critical'
-              ? `Critical Situation: ${conversation.participantName}`
-              : `Human Handoff Required: ${conversation.participantName}`,
-          message: handoffReason,
-          link: `/conversations`,
-          entityId: conversation.id,
         },
       });
 

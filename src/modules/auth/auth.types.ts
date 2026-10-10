@@ -7,6 +7,7 @@ export interface LoginDTO {
 
 export interface AuthResponseDTO {
   accessToken: string;
+  refreshToken: string;
   user: {
     id: string;
     name: string;

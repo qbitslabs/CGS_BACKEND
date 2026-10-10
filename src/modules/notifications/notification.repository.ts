@@ -7,6 +7,7 @@ export class NotificationRepository {
   async findMany(query: NotificationListQuery) {
     const where: any = {
       clinicId: query.clinicId,
+      type: { notIn: ['NEW_CONVERSATION', 'HUMAN_HANDOFF'] },
       OR: [{ userId: query.userId }, { userId: null }],
     };
 
@@ -39,6 +40,7 @@ export class NotificationRepository {
       where: {
         clinicId,
         isRead: false,
+        type: { notIn: ['NEW_CONVERSATION', 'HUMAN_HANDOFF'] },
         OR: [{ userId }, { userId: null }],
       },
       data: { isRead: true, readAt: new Date() },
@@ -50,6 +52,7 @@ export class NotificationRepository {
       where: {
         clinicId,
         isRead: false,
+        type: { notIn: ['NEW_CONVERSATION', 'HUMAN_HANDOFF'] },
         OR: [{ userId }, { userId: null }],
       },
     });

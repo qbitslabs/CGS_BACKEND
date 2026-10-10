@@ -9,6 +9,9 @@ export interface AuthUserPayload {
   role: UserRole;
   email: string;
   name: string;
+  sid?: string;
+  tokenUse?: 'staff';
+  type?: string;
 }
 
 export interface AdminAuthPayload {

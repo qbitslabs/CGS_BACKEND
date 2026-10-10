@@ -34,8 +34,8 @@ export const encryptToken = (rawToken: string): string => {
 };
 
 /**
- * Automatically decrypts a token stored in the database.
- * If the token is plaintext (legacy / unencrypted), it safely returns as-is.
+ * Decrypts a token stored in the database.
+ * A plaintext legacy token is returned as-is. A locked token that does not open is rejected.
  */
 export const decryptToken = (storedToken: string): string => {
   if (!storedToken || typeof storedToken !== 'string') return storedToken;
@@ -45,7 +45,9 @@ export const decryptToken = (storedToken: string): string => {
 
   try {
     const parts = storedToken.split(':');
-    if (parts.length !== 5) return storedToken;
+    if (parts.length !== 5) {
+      throw new Error('WhatsApp access token could not be unlocked. Save the clinic token again.');
+    }
 
     const [, , ivHex, tagHex, encryptedHex] = parts;
     const key = getMasterKey();
@@ -59,7 +61,7 @@ export const decryptToken = (storedToken: string): string => {
     decrypted += decipher.final('utf8');
     return decrypted;
   } catch (err: any) {
-    console.error('[Crypto] Failed to decrypt token, returning as-is:', err?.message || err);
-    return storedToken;
+    console.error('[Crypto] Failed to decrypt token:', err?.message || err);
+    throw new Error('WhatsApp access token could not be unlocked. Save the clinic token again.');
   }
 };

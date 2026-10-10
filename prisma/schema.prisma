@@ -319,6 +319,7 @@ model Clinic {
   conversationSummaryAddons ConversationSummaryAddon[]
   landingPage           ClinicLandingPage?
   workflowConfig        ClinicWorkflowConfig?
+  staffRefreshSessions  StaffRefreshSession[]
 
   @@index([status])
   @@index([createdAt])
@@ -363,11 +364,33 @@ model User {
   paymentsCollected     Payment[]             @relation("PaymentCollectedBy")
   notifications         Notification[]
   auditLogs             AuditLog[]
+  refreshSessions       StaffRefreshSession[]
 
   @@unique([clinicId, email])
   @@index([clinicId, role])
   @@index([clinicId, status])
   @@map("users")
+}
+
+model StaffRefreshSession {
+  id            String    @id @default(uuid()) @db.Uuid
+  userId        String    @map("user_id") @db.Uuid
+  clinicId      String    @map("clinic_id") @db.Uuid
+  tokenHash     String    @unique @map("token_hash")
+  expiresAt     DateTime  @map("expires_at")
+  revokedAt     DateTime? @map("revoked_at")
+  replacedById  String?   @map("replaced_by_id") @db.Uuid
+  userAgent     String?   @map("user_agent")
+  ipAddress     String?   @map("ip_address")
+  createdAt     DateTime  @default(now()) @map("created_at")
+  lastUsedAt    DateTime? @map("last_used_at")
+
+  user          User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  clinic        Clinic    @relation(fields: [clinicId], references: [id], onDelete: Cascade)
+
+  @@index([userId, revokedAt])
+  @@index([expiresAt])
+  @@map("staff_refresh_sessions")
 }
 
 model Doctor {
@@ -383,6 +406,7 @@ model Doctor {
   availabilityHours     String?               @default("09:00 AM - 07:00 PM") @map("availability_hours")
   isActive              Boolean               @default(true) @map("is_active")
   isPrimary             Boolean               @default(false) @map("is_primary")
+  maxBookingsPerSlot    Int                   @default(1) @map("max_bookings_per_slot")
   createdAt             DateTime              @default(now()) @map("created_at")
   updatedAt             DateTime              @updatedAt @map("updated_at")
 

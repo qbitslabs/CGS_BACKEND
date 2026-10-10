@@ -2,11 +2,20 @@
  * Clinic API layer for admin; talks Prisma or callers, not the AI database. */
 import { Router } from 'express';
 import { requireAdminAuth } from '../../middleware/auth.js';
+import { clientKey, rateLimit } from '../../middleware/rateLimit.js';
 import { adminController } from './admin.controller.js';
 
 const router = Router();
 
-router.post('/auth/login', adminController.login);
+router.post(
+  '/auth/login',
+  rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 10,
+    key: (req) => clientKey(req, `admin-login:${String(req.body?.email || '').toLowerCase()}`),
+  }),
+  adminController.login
+);
 router.get('/auth/me', requireAdminAuth, adminController.getMe);
 router.post('/auth/logout', requireAdminAuth, adminController.logout);
 
@@ -23,6 +32,7 @@ router.get('/clinics', adminController.getClinics);
 router.post('/clinics', adminController.createClinic);
 router.get('/clinics/:id', adminController.getClinicById);
 router.patch('/clinics/:id', adminController.updateClinic);
+router.patch('/clinics/:id/whatsapp-token', adminController.replaceWhatsAppToken);
 router.patch('/clinics/:id/ai-config', adminController.updateClinicAiConfig);
 router.post('/clinics/:id/users', adminController.addClinicUser);
 router.patch('/clinics/:id/primary-doctor', adminController.setPrimaryDoctor);

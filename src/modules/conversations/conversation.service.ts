@@ -289,7 +289,7 @@ export class ConversationService {
     };
   }
 
-  // Queue inbound text; flush once after a short quiet period so double-sends get one reply.
+  // Queue inbound text; flush once after a short quiet period so double-sends become one job.
   scheduleGenerateReply(clinicId: string, conversationId: string, userText: string) {
     let slot = pendingAiReplies.get(conversationId);
     if (!slot) {
@@ -313,25 +313,37 @@ export class ConversationService {
     }
     slot.running = true;
     const combined = joinInboundBurst(slot.texts.splice(0));
+    let retryDelay = 400;
     try {
       if (combined) {
-        await this.generateAndPersistReply(slot.clinicId, conversationId, combined);
+        await this.repo.enqueueAiReply({
+          clinicId: slot.clinicId,
+          conversationId,
+          userText: combined,
+        });
       }
     } catch (err: any) {
-      console.error('[AI Receptionist] debounced generate failed:', err?.message || err);
+      console.error('[AI Receptionist] queue generate failed:', err?.message || err);
+      if (combined) slot.texts.unshift(combined);
+      retryDelay = 5000;
     } finally {
       slot.running = false;
       if (slot.texts.length) {
         slot.timer = setTimeout(() => {
           void this.flushPendingAiReply(conversationId);
-        }, 400);
+        }, retryDelay);
       } else {
         pendingAiReplies.delete(conversationId);
       }
     }
   }
 
-  async generateAndPersistReply(clinicId: string, conversationId: string, userText: string) {
+  async generateAndPersistReply(
+    clinicId: string,
+    conversationId: string,
+    userText: string,
+    options?: { fallbackOnError?: boolean }
+  ) {
     const conversation = await this.repo.findById(conversationId, clinicId);
     if (!conversation) {
       throw new AppError('Conversation not found.', 404, 'NOT_FOUND');
@@ -462,7 +474,12 @@ export class ConversationService {
         '| status=',
         err?.statusCode || err?.status || 'n/a'
       );
-      if (msg.includes('402') || msg.toLowerCase().includes('credits')) {
+      const creditsExhausted = msg.includes('402') || msg.toLowerCase().includes('credits');
+      const fallbackOnError = options?.fallbackOnError ?? true;
+      if (!fallbackOnError && !creditsExhausted) {
+        throw err;
+      }
+      if (creditsExhausted) {
         replyText =
           'AI service credits are temporarily exhausted. A clinic coordinator will follow up with you shortly.';
       }

@@ -25,6 +25,7 @@ export interface CreateLeadDTO {
   preferredDoctor?: string;
   howHeardAboutDoctor?: string;
   intent?: LeadIntent;
+  score?: number;
   notes?: string;
   assignedToUserId?: string;
 }

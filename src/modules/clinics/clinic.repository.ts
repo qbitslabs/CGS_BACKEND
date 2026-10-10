@@ -56,6 +56,9 @@ export class ClinicRepository {
       ...((existing?.metadata as Record<string, unknown>) || {}),
       ...(data.metadata || {}),
     };
+    for (const retired of ['servicesTreatments', 'doctorsInfo', 'consultationDetails', 'timings']) {
+      delete mergedMetadata[retired];
+    }
 
     return prisma.entityAiConfig.upsert({
       where: { clinicId },

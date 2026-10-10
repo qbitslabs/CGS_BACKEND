@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    env:
+      JWT_SECRET: ci-only-jwt-secret
+      INTERNAL_SERVICE_SECRET: ci-only-internal-secret
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/clinic_growth_db?schema=public
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - run: npm install
+      - run: npx prisma generate
+      - run: npm test
+      - run: npx tsc --noEmit

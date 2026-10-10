@@ -5,7 +5,6 @@ import {
   AIBookAppointmentDTO,
   AIRescheduleAppointmentDTO,
   AIContextQueryDTO,
-  AILeadUpsertDTO,
   AIPatientQueryDTO,
   AIRecordUsageDTO,
   SyncSummaryDTO,
@@ -16,6 +15,8 @@ import { AppError } from '../../middleware/errorHandler.js';
 import { logAuditEvent } from '../../middleware/audit.js';
 import { prisma } from '../../config/db.js';
 import { conversationService } from '../conversations/conversation.service.js';
+import { decryptToken } from '../../utils/crypto.js';
+import { env } from '../../config/env.js';
 
 function formatDoctorName(firstName?: string | null, lastName?: string | null) {
   const full = `${firstName || ''} ${lastName || ''}`.trim();
@@ -27,6 +28,12 @@ function isConsultationService(service?: { category?: string | null; name?: stri
   if (cat === 'consultation' || cat === 'consult') return true;
   const name = (service?.name || '').trim().toLowerCase();
   return name === 'consultation' || name === 'consult' || name.includes('normal consultation');
+}
+
+function moneyOrNull(value: unknown): number | null {
+  if (value == null || value === '') return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
 }
 
 function mapAiService(s: { id: string; name: string; description?: string | null; price: any; durationMinutes: number; category?: string | null }) {
@@ -84,7 +91,7 @@ export class InternalService {
     });
     const placeholders = activeAccounts.filter((a) => !/^\d{10,20}$/.test(a.phoneNumberId));
 
-    if (placeholders.length === 1) {
+    if (placeholders.length === 1 && activeAccounts.length === 1) {
       console.warn(
         `[Internal] Auto-binding Meta phone_number_id ${phoneNumberId} onto WhatsApp account ${placeholders[0].id} (was "${placeholders[0].phoneNumberId}")`
       );
@@ -104,6 +111,26 @@ export class InternalService {
     }
 
     return null;
+  }
+
+  private async markInboundSeen(phoneNumberId: string, accessTokenEncrypted: string, messageId: string) {
+    try {
+      const accessToken = decryptToken(accessTokenEncrypted);
+      const response = await fetch(`${env.WHATSAPP_SERVICE_URL}/w_api/v1/whatsapp/read`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Service-Key': env.INTERNAL_SERVICE_SECRET,
+        },
+        body: JSON.stringify({ phoneNumberId, accessToken, messageId }),
+      });
+      if (!response.ok) {
+        const detail = await response.text();
+        console.warn('[WhatsApp] Read receipt was not accepted:', response.status, detail.slice(0, 180));
+      }
+    } catch (err: any) {
+      console.warn('[WhatsApp] Read receipt failed:', err?.message || err);
+    }
   }
 
   async handleWhatsAppEvent(dto: WhatsAppEventDTO) {
@@ -138,6 +165,8 @@ export class InternalService {
       accountId: account.id,
       data: dto,
     });
+
+    await this.markInboundSeen(account.phoneNumberId, account.accessTokenEncrypted, dto.providerMessageId);
 
     // Meta / gateway retries reuse the same providerMessageId — do not run AI twice
     if (!persisted.isNew) {
@@ -201,7 +230,7 @@ export class InternalService {
             id: targetDoctor.id,
             name: formatDoctorName(targetDoctor.user.firstName, targetDoctor.user.lastName),
             specialization: targetDoctor.specialization,
-            consultationFee: targetDoctor.consultationFee ? Number(targetDoctor.consultationFee) : 500,
+            consultationFee: moneyOrNull(targetDoctor.consultationFee),
             availabilityDays: targetDoctor.availabilityDays,
             availabilityHours: targetDoctor.availabilityHours,
           }
@@ -210,7 +239,7 @@ export class InternalService {
         id: d.id,
         name: formatDoctorName(d.user.firstName, d.user.lastName),
         specialization: d.specialization || 'Consultant',
-        consultationFee: d.consultationFee ? Number(d.consultationFee) : 500,
+        consultationFee: moneyOrNull(d.consultationFee),
         availabilityDays: d.availabilityDays,
         availabilityHours: d.availabilityHours,
         services: servicesForDoctor(d, services),
@@ -280,28 +309,6 @@ export class InternalService {
     };
   }
 
-  async getOrUpsertLead(dto: AILeadUpsertDTO) {
-    const lead = await this.repo.getOrUpsertLead(dto);
-    if (lead) {
-      await logAuditEvent({
-        clinicId: dto.clinicId,
-        actorId: 'AI_SERVICE',
-        actorEmail: 'ai-service@internal',
-        actorType: 'AI_SERVICE',
-        action: 'AI_LEAD_CAPTURED',
-        resourceType: 'LEAD',
-        resourceId: lead.id,
-        metadata: {
-          phone: dto.phone,
-          name: dto.name,
-          service: dto.interestedService,
-          intent: dto.intent,
-        },
-      });
-    }
-    return lead;
-  }
-
   async getAiDoctors(clinicId: string) {
     const [doctors, clinicServices] = await Promise.all([
       this.repo.getClinicDoctors(clinicId),
@@ -311,8 +318,8 @@ export class InternalService {
       id: d.id,
       name: formatDoctorName(d.user.firstName, d.user.lastName),
       specialization: d.specialization || 'Consultant',
-      consultationFee: d.consultationFee ? Number(d.consultationFee) : 500,
-      fee: d.consultationFee ? Number(d.consultationFee) : 500,
+      consultationFee: moneyOrNull(d.consultationFee),
+      fee: moneyOrNull(d.consultationFee),
       availabilityDays: d.availabilityDays,
       availabilityHours: d.availabilityHours,
       services: servicesForDoctor(d, clinicServices),
@@ -409,12 +416,17 @@ export class InternalService {
     ).filter((a) => !excludeAppointmentId || a.id !== excludeAppointmentId);
 
     const standardSlots = this.generateSlotsFromSchedule(hoursStr);
-    const bookedTimes = bookedAppointments.map((a) => {
-      const d = new Date(a.startsAt);
-      return d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true });
-    });
-
-    const availableSlots = standardSlots.filter((slot) => !bookedTimes.includes(slot));
+    const capacity = Math.min(20, Math.max(1, (doctor as { maxBookingsPerSlot?: number }).maxBookingsPerSlot || 1));
+    const bookedCountBySlot = new Map<string, number>();
+    for (const row of bookedAppointments) {
+      const label = new Date(row.startsAt).toLocaleTimeString('en-US', {
+        hour: '2-digit',
+        minute: '2-digit',
+        hour12: true,
+      });
+      bookedCountBySlot.set(label, (bookedCountBySlot.get(label) || 0) + 1);
+    }
+    const availableSlots = standardSlots.filter((slot) => (bookedCountBySlot.get(slot) || 0) < capacity);
 
     return {
       date,
@@ -573,7 +585,24 @@ export class InternalService {
       gender: dto.gender,
       allergies: dto.allergies,
       medicalHistoryNotes: dto.medicalHistoryNotes,
+    }).catch((err: any) => {
+      if (err?.message === 'SLOT_ALREADY_BOOKED') {
+        throw new AppError(
+          `Requested time ${dto.time} is not available on ${dto.date}.`,
+          409,
+          'SLOT_ALREADY_BOOKED'
+        );
+      }
+      if (err?.message === 'DOCTOR_NOT_IN_CLINIC') {
+        throw new AppError('Doctor does not belong to this clinic.', 404, 'DOCTOR_NOT_FOUND');
+      }
+      throw err;
     });
+
+    const saved = await this.repo.findAppointmentForAi(result.appointmentId, dto.clinicId);
+    if (!saved || saved.status === 'CANCELLED' || saved.status === 'NO_SHOW') {
+      throw new AppError('Appointment was not saved.', 500, 'BOOKING_NOT_PERSISTED');
+    }
 
     await logAuditEvent({
       clinicId: dto.clinicId,
@@ -582,12 +611,12 @@ export class InternalService {
       actorType: 'AI_SERVICE',
       action: 'AI_TOOL_BOOK_APPOINTMENT',
       resourceType: 'APPOINTMENT',
-      resourceId: result.appointmentId,
+      resourceId: saved.id,
       metadata: {
         doctorId,
         patientPhone: dto.patientPhone,
         patientId: result.patientId,
-        service: dto.service,
+        service: saved.service || dto.service,
         date: dto.date,
         time: dto.time,
         age: dto.age,
@@ -595,7 +624,12 @@ export class InternalService {
       },
     });
 
-    return result;
+    return {
+      ...result,
+      appointmentId: saved.id,
+      status: saved.status,
+      service: saved.service || result.service,
+    };
   }
 
   async rescheduleAppointment(dto: AIRescheduleAppointmentDTO) {
@@ -705,9 +739,26 @@ export class InternalService {
       date: dto.date,
       time: dto.time,
       notes: dto.notes,
+    }).catch((err: any) => {
+      if (err?.message === 'SLOT_ALREADY_BOOKED') {
+        throw new AppError(
+          `Requested time ${dto.time} is not available on ${dto.date}.`,
+          409,
+          'SLOT_ALREADY_BOOKED'
+        );
+      }
+      if (err?.message === 'DOCTOR_NOT_IN_CLINIC') {
+        throw new AppError('Doctor does not belong to this clinic.', 404, 'DOCTOR_NOT_FOUND');
+      }
+      throw err;
     });
     if (!result) {
       throw new AppError('Appointment not found.', 404, 'NOT_FOUND');
+    }
+
+    const saved = await this.repo.findAppointmentForAi(result.appointmentId, dto.clinicId);
+    if (!saved || saved.startsAt.getTime() !== startsAt.getTime()) {
+      throw new AppError('Appointment was not moved.', 500, 'BOOKING_NOT_PERSISTED');
     }
 
     await logAuditEvent({
@@ -729,6 +780,8 @@ export class InternalService {
 
     return {
       ...result,
+      appointmentId: saved.id,
+      status: saved.status,
       previousDate,
       previousTime,
       doctorName: result.doctorName || (availability as any).doctorName,

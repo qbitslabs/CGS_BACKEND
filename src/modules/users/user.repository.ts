@@ -108,6 +108,7 @@ export class UserRepository {
       if (data.consultationFee !== undefined) doctorUpdate.consultationFee = data.consultationFee;
       if (data.availabilityDays !== undefined) doctorUpdate.availabilityDays = data.availabilityDays;
       if (data.availabilityHours !== undefined) doctorUpdate.availabilityHours = data.availabilityHours;
+      if (data.maxBookingsPerSlot !== undefined) doctorUpdate.maxBookingsPerSlot = data.maxBookingsPerSlot;
       if (data.isActive !== undefined) doctorUpdate.isActive = data.isActive;
 
       if (Object.keys(doctorUpdate).length > 0 && existing.doctor) {
