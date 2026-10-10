@@ -13,14 +13,6 @@ export interface GenerateAIRequestDTO {
   temperature?: number;
 }
 
-export interface AIHealthStatusDTO {
-  aiService: string;
-  aiDetails?: any;
-  cgsInternalApi: string;
-  database: string;
-  error?: string;
-}
-
 export interface AIEntityCreateDTO {
   type: string;
   name: string;

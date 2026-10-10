@@ -2,41 +2,6 @@
  * Clinic API layer for admin; talks Prisma or callers, not the AI database. */
 import { z } from 'zod';
 
-export const createDoctorAdminSchema = z.object({
-  clinicId: z.string().uuid(),
-  email: z.string().email(),
-  password: z.string().min(6),
-  firstName: z.string().min(1),
-  lastName: z.string().optional(),
-  phone: z.string().optional(),
-  title: z.string().default('Dr.'),
-  specialization: z.string().default('General Physician'),
-  registrationNo: z.string().optional(),
-  consultationFee: z.number().min(0).default(500),
-  bio: z.string().optional(),
-  experienceYears: z.number().min(0).default(0),
-  qualification: z.string().optional(),
-  availabilityDays: z.array(z.string()).default(['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday']),
-  availabilityHours: z.string().default('09:00 AM - 05:00 PM'),
-  serviceIds: z.array(z.string().uuid()).optional(),
-});
-
-export const updateDoctorAdminSchema = z.object({
-  firstName: z.string().optional(),
-  lastName: z.string().optional(),
-  phone: z.string().optional(),
-  specialization: z.string().optional(),
-  registrationNo: z.string().optional(),
-  consultationFee: z.number().min(0).optional(),
-  bio: z.string().optional(),
-  experienceYears: z.number().min(0).optional(),
-  qualification: z.string().optional(),
-  availabilityDays: z.array(z.string()).optional(),
-  availabilityHours: z.string().optional(),
-  isActive: z.boolean().optional(),
-  serviceIds: z.array(z.string().uuid()).optional(),
-});
-
 export const setPrimaryDoctorSchema = z.object({
   userId: z.string().uuid().optional(),
   doctorId: z.string().uuid().optional(),

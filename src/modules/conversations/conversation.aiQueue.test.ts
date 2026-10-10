@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 vi.mock('../../config/db.js', () => ({
   prisma: {
     entityAiConfig: { findFirst: vi.fn(async () => null) },
-    whatsAppAccount: { findFirst: vi.fn(async () => null) },
+    whatsappAccount: { findFirst: vi.fn(async () => null) },
     message: { update: vi.fn() },
     job: { create: vi.fn(async () => ({ id: 'wa-retry' })) },
   },

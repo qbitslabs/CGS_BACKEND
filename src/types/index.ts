@@ -28,13 +28,3 @@ export interface AuthenticatedRequest extends Request {
   clinicId?: string;
   correlationId?: string;
 }
-
-export interface PaginatedResult<T> {
-  data: T[];
-  meta: {
-    page: number;
-    limit: number;
-    total: number;
-    totalPages: number;
-  };
-}

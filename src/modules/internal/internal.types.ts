@@ -27,12 +27,6 @@ export interface AIPatientQueryDTO {
   patientId?: string;
 }
 
-export interface AIAvailabilityQueryDTO {
-  clinicId: string;
-  doctorId?: string;
-  date: string;
-}
-
 export interface AIBookAppointmentDTO {
   clinicId: string;
   patientPhone: string;
@@ -55,13 +49,6 @@ export interface AIRescheduleAppointmentDTO {
   time: string;
   doctorId?: string;
   notes?: string;
-}
-
-export interface AIHandoffDTO {
-  clinicId: string;
-  conversationId: string;
-  reason: string;
-  severity?: 'normal' | 'critical';
 }
 
 export interface AIRecordUsageDTO {

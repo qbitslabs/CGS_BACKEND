@@ -554,8 +554,8 @@ export class ConversationService {
     content: string;
   }): Promise<boolean> {
     try {
-      const account = await prisma.whatsAppAccount.findFirst({
-        where: { clinicId: params.clinicId, status: 'CONNECTED' },
+      const account = await prisma.whatsappAccount.findFirst({
+        where: { clinicId: params.clinicId, isActive: true },
       });
       if (!account?.phoneNumberId || !account.accessTokenEncrypted) return false;
 
@@ -569,12 +569,14 @@ export class ConversationService {
         body: JSON.stringify({
           phoneNumberId: account.phoneNumberId,
           accessToken,
-          to: params.recipientPhone,
-          type: 'text',
+          recipientPhone: params.recipientPhone,
           text: params.content,
         }),
       });
-      const resData = await response.json().catch(() => ({}));
+      const resData = (await response.json().catch(() => ({}))) as {
+        success?: boolean;
+        data?: { messages?: { id?: string }[] };
+      };
       if (!response.ok || resData?.success === false) {
         console.error('[AI Receptionist] WhatsApp send failed:', response.status);
         return false;
