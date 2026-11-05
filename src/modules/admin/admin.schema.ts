@@ -2,6 +2,19 @@
  * Clinic API layer for admin; talks Prisma or callers, not the AI database. */
 import { z } from 'zod';
 
+export const recordClinicAddonSchema = z.object({
+  type: z.enum([
+    'EXTRA_DOCTOR',
+    'EXTRA_STAFF',
+    'EXTRA_AI_REPLIES',
+    'EXTRA_WHATSAPP_NUMBER',
+    'PRIORITY_SUPPORT',
+    'EXTRA_AUTOMATION',
+  ]),
+  quantity: z.number().int().min(1).max(20).optional(),
+  automationKey: z.string().optional(),
+});
+
 export const setPrimaryDoctorSchema = z.object({
   userId: z.string().uuid().optional(),
   doctorId: z.string().uuid().optional(),
@@ -50,6 +63,8 @@ export const createClinicAdminSchema = z.object({
   closingTime: z.string().optional(),
   tier: z.enum(['STARTER', 'GROWTH', 'ENTERPRISE', 'CUSTOM']).optional(),
   planId: z.string().uuid().optional(),
+  earlyBird: z.boolean().optional(),
+  addons: z.array(recordClinicAddonSchema).max(12).optional(),
   landingPage: z
     .object({
       title: z.string().optional(),
@@ -57,10 +72,6 @@ export const createClinicAdminSchema = z.object({
       primaryCta: z.string().optional(),
       whatsappNumber: z.string().optional(),
       enquiryFormEnabled: z.boolean().optional(),
-      services: z.array(z.any()).optional(),
-      doctors: z.array(z.any()).optional(),
-      address: z.string().optional(),
-      additionalInfo: z.string().optional(),
     })
     .optional(),
   whatsapp: z
@@ -73,7 +84,6 @@ export const createClinicAdminSchema = z.object({
       webhookUrl: z.string().optional(),
       verifyToken: z.string().optional(),
       webhookStatus: z.string().optional(),
-      messageTemplates: z.record(z.string()).optional(),
     })
     .optional(),
   ai: z
@@ -86,39 +96,6 @@ export const createClinicAdminSchema = z.object({
       faqs: z.string().optional(),
       isAiEnabled: z.boolean().optional(),
     })
-    .optional(),
-  workflow: z
-    .object({
-      qualificationEnabled: z.boolean().optional(),
-      appointmentEnabled: z.boolean().optional(),
-      reminderEnabled: z.boolean().optional(),
-      followUpEnabled: z.boolean().optional(),
-      noResponseEnabled: z.boolean().optional(),
-      staffHandoffEnabled: z.boolean().optional(),
-      followUpHours: z.number().optional(),
-      reminderHoursBefore: z.number().optional(),
-    })
-    .optional(),
-      staff: z
-    .array(
-      z.object({
-        name: z.string().min(1),
-        email: z.string().email(),
-        phone: z.string().optional(),
-        password: z.string().min(6, 'Password must be at least 6 characters'),
-        roleLabel: z.enum(['CLINIC_ADMIN', 'DOCTOR', 'RECEPTIONIST', 'STAFF']),
-        permissions: z.array(z.string()).optional(),
-      })
-    )
-    .optional(),
-  services: z
-    .array(
-      z.object({
-        name: z.string().min(1),
-        price: z.number().optional(),
-        durationMinutes: z.number().optional(),
-      })
-    )
     .optional(),
 });
 
@@ -154,7 +131,7 @@ export const createClinicUserAdminSchema = z.object({
   qualification: z.string().optional(),
   experienceYears: z.number().optional(),
   consultationFee: z.number().optional(),
-  password: z.string().min(6).optional(),
+  password: z.string().min(6, 'Password must be at least 6 characters'),
 });
 
 export const aiUsageFilterSchema = z.object({
@@ -174,4 +151,10 @@ export const publicLandingEnquirySchema = z.object({
   howYouFindUs: z.string().min(1),
   preferredDoctor: z.string().min(1),
   service: z.string().min(1),
+});
+
+export const assignClinicPlanSchema = z.object({
+  planId: z.string().uuid(),
+  status: z.enum(['TRIAL', 'ACTIVE', 'PAST_DUE', 'SUSPENDED', 'CANCELLED', 'EXPIRED']),
+  earlyBird: z.boolean(),
 });

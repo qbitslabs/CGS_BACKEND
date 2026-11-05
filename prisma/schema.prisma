@@ -60,6 +60,40 @@ enum SubscriptionStatus {
   EXPIRED
 }
 
+enum PlanModelLevel {
+  NORMAL
+  HIGH_END
+}
+
+enum PlanMemory {
+  NONE
+  FULL
+}
+
+enum PlanReporting {
+  BASIC
+  ADVANCED
+}
+
+enum ClinicAddonType {
+  EXTRA_DOCTOR
+  EXTRA_STAFF
+  EXTRA_AI_REPLIES
+  EXTRA_WHATSAPP_NUMBER
+  PRIORITY_SUPPORT
+  EXTRA_AUTOMATION
+}
+
+enum ClinicAddonBilling {
+  MONTHLY
+  ONE_TIME
+}
+
+enum ClinicAddonStatus {
+  PENDING
+  ACTIVE
+}
+
 enum LeadStatus {
   NEW
   CONTACTED
@@ -303,6 +337,8 @@ model Clinic {
   paymentAuthorizations PaymentAuthorization[]
   cgsSubscriptions      CgsSubscription[]
   subscriptionInvoices  SubscriptionInvoice[]
+  addons                ClinicAddon[]
+  aiReplyPeriods        ClinicAiReplyPeriod[]
   subscriptionPayments  SubscriptionPayment[]
   paymentMethods        PaymentMethodRecord[]
   metaCampaigns         MetaCampaign[]
@@ -872,6 +908,21 @@ model SubscriptionPlan {
   aiTokensIncluded      Int                   @default(1000000) @map("ai_tokens_included")
   overageRateWhatsApp   Decimal               @default(0.40) @map("overage_rate_whatsapp") @db.Decimal(14, 8)
   overageRateAi1k       Decimal               @default(0.15) @map("overage_rate_ai_1k") @db.Decimal(14, 8)
+  doctorsIncluded       Int                   @default(1) @map("doctors_included")
+  staffIncluded         Int                   @default(2) @map("staff_included")
+  whatsappNumbersIncluded Int                 @default(1) @map("whatsapp_numbers_included")
+  aiRepliesMonthly      Int                   @default(0) @map("ai_replies_monthly")
+  modelLevel            PlanModelLevel        @default(NORMAL) @map("model_level")
+  conversationMemory    PlanMemory            @default(NONE) @map("conversation_memory")
+  reportingLevel        PlanReporting         @default(BASIC) @map("reporting_level")
+  customAiIncluded      Boolean               @default(false) @map("custom_ai_included")
+  outboundIncluded      Boolean               @default(false) @map("outbound_included")
+  prioritySupportIncluded Boolean             @default(false) @map("priority_support_included")
+  regularMonthlyPrice   Decimal               @default(0) @map("regular_monthly_price") @db.Decimal(12, 2)
+  earlyBirdMonthlyPrice Decimal               @default(0) @map("early_bird_monthly_price") @db.Decimal(12, 2)
+  regularSetupFee       Decimal               @default(0) @map("regular_setup_fee") @db.Decimal(12, 2)
+  earlyBirdSetupFee     Decimal               @default(0) @map("early_bird_setup_fee") @db.Decimal(12, 2)
+  automationKeys        String[]              @default([]) @map("automation_keys")
   isActive              Boolean               @default(true) @map("is_active")
   createdAt             DateTime              @default(now()) @map("created_at")
   updatedAt             DateTime              @updatedAt @map("updated_at")
@@ -891,15 +942,55 @@ model CgsSubscription {
   currentPeriodStart    DateTime              @map("current_period_start")
   currentPeriodEnd      DateTime              @map("current_period_end")
   autoRenew             Boolean               @default(true) @map("auto_renew")
+  earlyBird             Boolean               @default(false) @map("early_bird")
+  limitsApply           Boolean               @default(false) @map("limits_apply")
   createdAt             DateTime              @default(now()) @map("created_at")
   updatedAt             DateTime              @updatedAt @map("updated_at")
 
   clinic                Clinic                @relation(fields: [clinicId], references: [id], onDelete: Restrict)
   plan                  SubscriptionPlan      @relation(fields: [planId], references: [id], onDelete: Restrict)
   invoices              SubscriptionInvoice[]
+  addons                ClinicAddon[]
 
   @@index([clinicId, status])
+  @@index([earlyBird])
   @@map("cgs_subscriptions")
+}
+
+model ClinicAddon {
+  id                    String                @id @default(uuid()) @db.Uuid
+  clinicId              String                @map("clinic_id") @db.Uuid
+  subscriptionId        String?               @map("subscription_id") @db.Uuid
+  type                  ClinicAddonType
+  price                 Decimal               @db.Decimal(12, 2)
+  quantity              Int                   @default(1)
+  billing               ClinicAddonBilling
+  status                ClinicAddonStatus     @default(PENDING)
+  automationKey         String?               @map("automation_key")
+  periodStart           DateTime?             @map("period_start")
+  periodEnd             DateTime?             @map("period_end")
+  createdAt             DateTime              @default(now()) @map("created_at")
+  updatedAt             DateTime              @updatedAt @map("updated_at")
+
+  clinic                Clinic                @relation(fields: [clinicId], references: [id], onDelete: Restrict)
+  subscription          CgsSubscription?      @relation(fields: [subscriptionId], references: [id], onDelete: Restrict)
+
+  @@index([clinicId, status])
+  @@map("clinic_addons")
+}
+
+model ClinicAiReplyPeriod {
+  id                    String                @id @default(uuid()) @db.Uuid
+  clinicId              String                @map("clinic_id") @db.Uuid
+  periodStart           DateTime              @map("period_start")
+  replyCount            Int                   @default(0) @map("reply_count")
+  createdAt             DateTime              @default(now()) @map("created_at")
+  updatedAt             DateTime              @updatedAt @map("updated_at")
+
+  clinic                Clinic                @relation(fields: [clinicId], references: [id], onDelete: Restrict)
+
+  @@unique([clinicId, periodStart])
+  @@map("clinic_ai_reply_periods")
 }
 
 model SubscriptionInvoice {
@@ -911,6 +1002,7 @@ model SubscriptionInvoice {
   usageCharges          Decimal                   @default(0) @map("usage_charges") @db.Decimal(12, 2)
   adjustments           Decimal                   @default(0) @db.Decimal(12, 2)
   total                 Decimal                   @db.Decimal(12, 2)
+  notes                 String?
   status                SubscriptionInvoiceStatus @default(DRAFT)
   periodStart           DateTime                  @map("period_start")
   periodEnd             DateTime                  @map("period_end")

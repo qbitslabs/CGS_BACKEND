@@ -87,10 +87,13 @@ export class PatientRepository {
       where.status = query.status.toUpperCase().replace(/\s+/g, '_');
     }
     if (query.search) {
+      const term = query.search.trim();
+      const digits = term.replace(/\D/g, '');
       where.OR = [
-        { name: { contains: query.search, mode: 'insensitive' } },
-        { phone: { contains: query.search } },
-        { email: { contains: query.search, mode: 'insensitive' } },
+        { name: { contains: term, mode: 'insensitive' } },
+        { phone: { contains: term } },
+        { email: { contains: term, mode: 'insensitive' } },
+        ...(digits.length >= 4 && digits !== term ? [{ phone: { contains: digits } }] : []),
       ];
     }
     if (query.doctorId) {

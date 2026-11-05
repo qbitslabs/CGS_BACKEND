@@ -39,7 +39,7 @@ export class AdminRepository {
     ]);
 
     const whatsAppConversations = whatsAppUsageAgg._sum?.quantity || totalConversations || 0;
-    const whatsAppCost = Number(whatsAppUsageAgg._sum?.totalCost || (whatsAppConversations * 0.4));
+    const whatsAppCost = Number(whatsAppUsageAgg._sum?.totalCost || 0);
 
     return {
       totalClinics,
@@ -168,7 +168,7 @@ export class AdminRepository {
       where,
       include: {
         doctors: { include: { user: true } },
-        cgsSubscriptions: { include: { plan: true }, where: { status: 'ACTIVE' }, take: 1 },
+        cgsSubscriptions: { include: { plan: true }, where: { status: 'ACTIVE' }, orderBy: { createdAt: 'desc' }, take: 1 },
         aiConfig: true,
         _count: {
           select: {
@@ -194,7 +194,14 @@ export class AdminRepository {
         users: { include: { doctor: true }, orderBy: { createdAt: 'asc' } },
         doctors: { include: { user: true } },
         services: true,
-        cgsSubscriptions: { include: { plan: true }, orderBy: { createdAt: 'desc' } },
+        cgsSubscriptions: {
+          include: {
+            plan: true,
+            invoices: { orderBy: { periodStart: 'desc' }, take: 12 },
+          },
+          orderBy: { createdAt: 'desc' },
+        },
+        addons: { orderBy: { createdAt: 'desc' } },
         whatsappAccounts: true,
         aiConfig: true,
         landingPage: true,
@@ -324,7 +331,7 @@ export class AdminRepository {
     return prisma.subscriptionPlan.findUnique({ where: { id } });
   }
 
-  async createClinicSubscription(clinicId: string, planId: string) {
+  async createClinicSubscription(clinicId: string, planId: string, earlyBird = false) {
     const now = new Date();
     const periodEnd = new Date(now);
     periodEnd.setMonth(periodEnd.getMonth() + 1);
@@ -338,6 +345,8 @@ export class AdminRepository {
         currentPeriodStart: now,
         currentPeriodEnd: periodEnd,
         autoRenew: true,
+        earlyBird,
+        limitsApply: true,
       },
     });
   }
@@ -399,10 +408,6 @@ export class AdminRepository {
     primaryCta?: string;
     whatsappNumber?: string;
     enquiryFormEnabled?: boolean;
-    services?: unknown;
-    doctors?: unknown;
-    address?: string;
-    additionalInfo?: string;
   }) {
     return prisma.clinicLandingPage.create({
       data: {
@@ -413,37 +418,7 @@ export class AdminRepository {
         primaryCta: data.primaryCta,
         whatsappNumber: data.whatsappNumber,
         enquiryFormEnabled: data.enquiryFormEnabled ?? true,
-        services: data.services as any,
-        doctors: data.doctors as any,
-        address: data.address,
-        additionalInfo: data.additionalInfo,
         isPublished: true,
-      },
-    });
-  }
-
-  async createClinicWorkflowConfig(data: {
-    clinicId: string;
-    qualificationEnabled?: boolean;
-    appointmentEnabled?: boolean;
-    reminderEnabled?: boolean;
-    followUpEnabled?: boolean;
-    noResponseEnabled?: boolean;
-    staffHandoffEnabled?: boolean;
-    followUpHours?: number;
-    reminderHoursBefore?: number;
-  }) {
-    return prisma.clinicWorkflowConfig.create({
-      data: {
-        clinicId: data.clinicId,
-        qualificationEnabled: data.qualificationEnabled ?? true,
-        appointmentEnabled: data.appointmentEnabled ?? true,
-        reminderEnabled: data.reminderEnabled ?? true,
-        followUpEnabled: data.followUpEnabled ?? true,
-        noResponseEnabled: data.noResponseEnabled ?? true,
-        staffHandoffEnabled: data.staffHandoffEnabled ?? true,
-        followUpHours: data.followUpHours ?? 24,
-        reminderHoursBefore: data.reminderHoursBefore ?? 24,
       },
     });
   }
@@ -458,7 +433,6 @@ export class AdminRepository {
     webhookUrl?: string;
     verifyToken?: string;
     webhookStatus?: string;
-    messageTemplates?: Record<string, string>;
   }) {
     return prisma.whatsappAccount.create({
       data: {
@@ -471,7 +445,6 @@ export class AdminRepository {
         webhookUrl: data.webhookUrl,
         verifyToken: data.verifyToken,
         webhookStatus: data.webhookStatus || 'PENDING',
-        messageTemplates: data.messageTemplates as any,
         isActive: true,
       },
     });
@@ -499,26 +472,6 @@ export class AdminRepository {
         metadata: data.metadata as any,
       },
     });
-  }
-
-  async createClinicServices(
-    clinicId: string,
-    services: Array<{ name: string; price?: number; durationMinutes?: number }>
-  ) {
-    if (!services.length) return [];
-    return prisma.$transaction(
-      services.map((s) =>
-        prisma.service.create({
-          data: {
-            clinicId,
-            name: s.name,
-            price: s.price ?? 0,
-            durationMinutes: s.durationMinutes ?? 30,
-            isActive: true,
-          },
-        })
-      )
-    );
   }
 
   async listPlatformUsers() {
@@ -588,6 +541,7 @@ export class AdminRepository {
       where: { id },
       data: {
         status: 'PENDING',
+        attempts: 0,
         lastError: null,
         lockedAt: null,
         lockedBy: null,
@@ -799,6 +753,16 @@ export class AdminRepository {
         },
       },
       orderBy: { periodStart: 'desc' },
+    });
+  }
+
+  async findSubscriptionInvoice(id: string) {
+    return prisma.subscriptionInvoice.findUnique({
+      where: { id },
+      include: {
+        clinic: { select: { name: true, email: true, phone: true, address: true, city: true } },
+        subscription: { include: { plan: { select: { name: true } } } },
+      },
     });
   }
 

@@ -11,6 +11,7 @@ import {
 import { AppError } from '../../middleware/errorHandler.js';
 import { logAuditEvent } from '../../middleware/audit.js';
 import { aiClient } from '../ai/ai.client.js';
+import { claimConversationWindow, loadEntitlement, releaseAiReply } from '../admin/entitlements.js';
 import { prisma } from '../../config/db.js';
 import { env } from '../../config/env.js';
 import { decryptToken } from '../../utils/crypto.js';
@@ -18,6 +19,12 @@ import { randomUUID } from 'crypto';
 
 // Two WhatsApp bubbles in a short burst → one AI reply (join texts).
 const AI_REPLY_DEBOUNCE_MS = 400;
+const AI_LIMIT_HANDOFF =
+  "This month's AI conversations are used up. A clinic coordinator will continue from here.";
+const AI_TROUBLE_REPLY =
+  'I am having trouble reaching the AI receptionist right now. A coordinator will follow up shortly.';
+const AI_CREDITS_REPLY =
+  'AI service credits are temporarily exhausted. A clinic coordinator will follow up with you shortly.';
 
 type PendingAi = {
   clinicId: string;
@@ -238,7 +245,7 @@ export class ConversationService {
       senderName: message.senderName,
       text: message.content,
       timestamp: message.createdAt.toISOString(),
-      status: 'sent',
+      status: 'pending',
     };
   }
 
@@ -260,6 +267,9 @@ export class ConversationService {
     }
 
     const updated = await this.repo.updateConversation(id, clinicId, data);
+    if (!updated) {
+      throw new AppError('Conversation not found.', 404, 'NOT_FOUND');
+    }
 
     await logAuditEvent({
       clinicId,
@@ -365,6 +375,11 @@ export class ConversationService {
     // Keyword fast-path: escalate before/without waiting for the LLM tool call.
     const handoff = detectHandoffIntent(userText, specialtyKeywords);
     if (handoff) {
+      try {
+        await claimConversationWindow(clinicId, conversationId);
+      } catch (err) {
+        if (!(err instanceof AppError && err.code === 'AI_REPLY_LIMIT')) throw err;
+      }
       await this.repo.escalateHandoff({
         clinicId,
         conversationId,
@@ -390,8 +405,41 @@ export class ConversationService {
       };
     }
 
-    let replyText =
-      'I am having trouble reaching the AI receptionist right now. A coordinator will follow up shortly.';
+    const entitlement = await loadEntitlement(clinicId);
+    let countedPeriod: Date | null = null;
+    if (entitlement.enforced) {
+      try {
+        const claim = await claimConversationWindow(clinicId, conversationId);
+        countedPeriod = claim.counted ? claim.periodStart : null;
+      } catch (err) {
+        if (err instanceof AppError && err.code === 'AI_REPLY_LIMIT') {
+          await logAuditEvent({
+            clinicId,
+            actorId: 'AI_RECEPTIONIST',
+            actorEmail: 'ai@clinic',
+            actorType: 'SYSTEM',
+            action: 'AI_REPLY_LIMIT',
+            resourceType: 'CONVERSATION',
+            resourceId: conversationId,
+            metadata: { message: err.message },
+          });
+          const message = await this.deliverAiWhatsApp({
+            clinicId,
+            conversationId,
+            content: AI_LIMIT_HANDOFF,
+            recipientPhone: conversation.participantPhone,
+          });
+          return {
+            message: this.mapMessage(message),
+            toolCalls: [],
+          };
+        }
+        throw err;
+      }
+    }
+
+    let replyText = AI_TROUBLE_REPLY;
+    let failedReply = false;
     let raw: any = null;
 
     try {
@@ -403,6 +451,9 @@ export class ConversationService {
         channel: 'WHATSAPP',
         doctor_id: conversation.doctorId || undefined,
         conversation_id: conversation.id,
+        ...(entitlement.enforced
+          ? { model_level: entitlement.modelLevel, memory: entitlement.conversationMemory }
+          : {}),
         metadata: {
           conversationId: conversation.id,
           clinicId,
@@ -420,6 +471,7 @@ export class ConversationService {
         },
       });
       replyText = raw?.response || raw?.data?.response || replyText;
+      if (replyText === AI_TROUBLE_REPLY || replyText === AI_CREDITS_REPLY) failedReply = true;
 
       // Record usage from generate response (do not rely only on AI→CGS reverse POST)
       const usage = raw?.usage || raw?.data?.usage;
@@ -478,13 +530,23 @@ export class ConversationService {
       );
       const creditsExhausted = msg.includes('402') || msg.toLowerCase().includes('credits');
       const fallbackOnError = options?.fallbackOnError ?? true;
+      failedReply = true;
       if (!fallbackOnError && !creditsExhausted) {
+        if (countedPeriod) {
+          await releaseAiReply(clinicId, countedPeriod).catch((releaseErr: any) => {
+            console.warn('[AI Receptionist] could not release the conversation:', releaseErr?.message || releaseErr);
+          });
+        }
         throw err;
       }
-      if (creditsExhausted) {
-        replyText =
-          'AI service credits are temporarily exhausted. A clinic coordinator will follow up with you shortly.';
-      }
+      replyText = creditsExhausted ? AI_CREDITS_REPLY : AI_TROUBLE_REPLY;
+    }
+
+    if (failedReply && countedPeriod) {
+      await releaseAiReply(clinicId, countedPeriod).catch((releaseErr: any) => {
+        console.warn('[AI Receptionist] could not release the conversation:', releaseErr?.message || releaseErr);
+      });
+      countedPeriod = null;
     }
 
     // If AI tool requested handoff during generation, state may already be HANDOFF_PENDING.
@@ -493,6 +555,7 @@ export class ConversationService {
       conversationId,
       content: replyText,
       recipientPhone: conversation.participantPhone,
+      isAiGenerated: !failedReply,
     });
 
     return {
@@ -507,12 +570,14 @@ export class ConversationService {
     conversationId: string;
     content: string;
     recipientPhone?: string | null;
+    isAiGenerated?: boolean;
   }) {
     const message = await this.repo.persistAiOutboundMessage({
       clinicId: params.clinicId,
       conversationId: params.conversationId,
       content: params.content,
       recipientPhone: params.recipientPhone || undefined,
+      isAiGenerated: params.isAiGenerated !== false,
     });
 
     if (!params.recipientPhone) return message;
@@ -583,11 +648,15 @@ export class ConversationService {
       }
 
       const providerId = resData?.data?.messages?.[0]?.id;
+      if (!providerId) {
+        console.error('[AI Receptionist] WhatsApp accepted the send without a message id');
+        return false;
+      }
       await prisma.message.update({
         where: { id: params.messageId },
         data: {
-          status: 'DELIVERED',
-          ...(providerId ? { providerMessageId: providerId } : {}),
+          status: 'SENT',
+          providerMessageId: providerId,
         },
       });
       return true;

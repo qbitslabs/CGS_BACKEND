@@ -20,6 +20,7 @@ export interface AuthResponseDTO {
     doctorId?: string;
     isPrimaryDoctor?: boolean;
     seesAllClinicData?: boolean;
+    outboundAllowed?: boolean;
   };
 }
 
@@ -35,5 +36,6 @@ export interface AuthUserProfileDTO {
   doctorId?: string;
   isPrimaryDoctor?: boolean;
   seesAllClinicData?: boolean;
+  outboundAllowed?: boolean;
   permissions: string[];
 }

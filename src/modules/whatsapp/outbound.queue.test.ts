@@ -6,6 +6,10 @@ vi.mock('../conversations/conversation.service.js', () => ({
   conversationService: { scheduleGenerateReply },
 }));
 
+vi.mock('../admin/entitlements.js', () => ({
+  automationAllowed: vi.fn(async () => true),
+}));
+
 vi.mock('../../config/db.js', () => ({
   prisma: {
     appointment: { findFirst: vi.fn() },
@@ -15,11 +19,13 @@ vi.mock('../../config/db.js', () => ({
     conversation: { findFirst: vi.fn(), create: vi.fn(), update: vi.fn() },
     message: { findFirst: vi.fn(), create: vi.fn(), updateMany: vi.fn() },
     invoice: { findFirst: vi.fn() },
+    $executeRaw: vi.fn(async () => 1),
     $transaction: vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => fn(prismaTx)),
   },
 }));
 
 import { prisma } from '../../config/db.js';
+import { automationAllowed } from '../admin/entitlements.js';
 import { executeTemplateSendJob, queueTemplateSends } from './outbound.service.js';
 
 const prismaTx = prisma;
@@ -49,6 +55,7 @@ describe('template outbound queue', () => {
     vi.mocked(prisma.message.create).mockImplementation(async ({ data }: any) => ({ id: `msg-${data.conversationId}`, ...data }));
     vi.mocked(prisma.job.create).mockImplementation(async ({ data }: any) => ({ id: `job-${data.payload.recipientPhone}`, ...data }));
     vi.mocked(prisma.$transaction).mockImplementation(async (fn: any) => fn(prisma));
+    vi.mocked(automationAllowed).mockResolvedValue(true);
   });
 
   it('creates a separate job for each recipient and does not start the AI', async () => {
@@ -106,6 +113,42 @@ describe('template outbound queue', () => {
     await expect(queueTemplateSends('clinic-a', 'REMINDER', { appointmentIds: ['apt-from-clinic-b'] })).rejects.toThrow(
       /not found in this clinic/
     );
+  });
+
+  it('does not queue a follow-up the plan no longer includes', async () => {
+    vi.mocked(automationAllowed).mockResolvedValue(false);
+    const result = await queueTemplateSends('clinic-a', 'FOLLOWUP', { appointmentIds: ['apt-1'] });
+    expect(result.queued).toHaveLength(0);
+    expect(result.skipped[0]?.reason).toBe('PLAN');
+    expect(prisma.job.create).not.toHaveBeenCalled();
+    expect(automationAllowed).toHaveBeenCalledWith('clinic-a', 'COMPLETED_VISIT');
+  });
+
+  it('skips a queued reactivation when the clinic plan no longer includes it', async () => {
+    vi.mocked(automationAllowed).mockResolvedValue(false);
+    vi.mocked(prisma.message.findFirst).mockResolvedValue({ id: 'msg-1', providerMessageId: null } as any);
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+
+    const outcome = await executeTemplateSendJob({
+      clinicId: 'clinic-a',
+      attempts: 1,
+      maxAttempts: 3,
+      payload: {
+        messageId: 'msg-1',
+        recipientPhone: '919876543210',
+        templateKey: 'OLD_PATIENT_REACTIVATION',
+        templateName: 'cgs_old_patient_reactivation',
+        languageCode: 'en',
+        parameters: ['Ana', 'City Clinic'],
+      },
+    });
+
+    expect(outcome).toBe('skipped');
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(prisma.message.updateMany).toHaveBeenCalled();
+    expect(automationAllowed).toHaveBeenCalledWith('clinic-a', 'PATIENT_REACTIVATION');
+    vi.unstubAllGlobals();
   });
 
   it('does not call Meta again when the message already has a WhatsApp id', async () => {
@@ -317,6 +360,45 @@ describe('template outbound queue', () => {
     expect(prisma.message.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({
         data: expect.objectContaining({ status: 'SENT', providerMessageId: 'wamid.template', mediaType: 'cgs_invoice_bill' }),
+      })
+    );
+    vi.unstubAllGlobals();
+  });
+
+  it('does not send a reminder after the visit is cancelled', async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    vi.mocked(prisma.message.findFirst).mockResolvedValue({ id: 'msg-1', providerMessageId: null } as any);
+    vi.mocked(prisma.message.updateMany).mockResolvedValue({ count: 1 } as any);
+    vi.mocked(prisma.appointment.findFirst).mockResolvedValue({
+      status: 'CANCELLED',
+      startsAt: new Date('2026-10-07T10:30:00.000Z'),
+      endsAt: new Date('2026-10-07T11:00:00.000Z'),
+    } as any);
+
+    await executeTemplateSendJob({
+      clinicId: 'clinic-a',
+      attempts: 1,
+      maxAttempts: 3,
+      payload: {
+        messageId: 'msg-1',
+        recipientPhone: '919876543210',
+        templateKey: 'REMINDER',
+        templateName: 'cgs_appointment_reminder',
+        languageCode: 'en',
+        recordId: 'apt-1',
+        appointmentStartsAt: '2026-10-07T10:30:00.000Z',
+        parameters: ['Ana', 'City Clinic', 'Dr. Shah', '07 Oct 2026', '4:00 pm'],
+        trySessionFirst: true,
+        sessionText: 'Hello Ana',
+      },
+    });
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(prisma.message.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ id: 'msg-1', clinicId: 'clinic-a', providerMessageId: null }),
+        data: { status: 'FAILED' },
       })
     );
     vi.unstubAllGlobals();

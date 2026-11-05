@@ -4,6 +4,7 @@ import { prisma } from '../../config/db.js';
 import { InvoiceListQuery } from './billing.types.js';
 import { clinicDayBoundsUtc } from '../../utils/timezone.js';
 import { Prisma } from '@prisma/client';
+import { nextInvoiceNumber } from './invoiceNumber.js';
 
 export class BillingRepository {
   async findDoctorInClinic(doctorId: string, clinicId: string) {
@@ -105,9 +106,15 @@ export class BillingRepository {
     return prisma.$transaction(async (tx) => {
       await tx.$queryRaw(Prisma.sql`SELECT id FROM clinics WHERE id = ${params.clinicId}::uuid FOR UPDATE`);
 
-      const count = await tx.invoice.count({ where: { clinicId: params.clinicId } });
       const year = new Date().getFullYear();
-      const invoiceNumber = `INV-${year}-${String(count + 1).padStart(4, '0')}`;
+      const existing = await tx.invoice.findMany({
+        where: { clinicId: params.clinicId, invoiceNumber: { startsWith: `INV-${year}-` } },
+        select: { invoiceNumber: true },
+      });
+      const invoiceNumber = nextInvoiceNumber(
+        existing.map((row) => row.invoiceNumber),
+        year,
+      );
 
       const paidAmount = Math.max(0, params.total);
       const amountDue = 0;

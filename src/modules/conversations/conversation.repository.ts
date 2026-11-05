@@ -1,6 +1,7 @@
 /* CGS conversations module — Prisma queries.
  * Clinic API layer for conversations; talks Prisma or callers, not the AI database. */
 import { prisma } from '../../config/db.js';
+import { conversationVisibleToDoctor } from '../../utils/doctorScope.js';
 import { AI_GENERATE_REPLY_JOB } from '../../workers/jobClaim.js';
 import { ConversationListQuery, UpdateConversationDTO } from './conversation.types.js';
 
@@ -18,16 +19,7 @@ export class ConversationRepository {
       where: {
         clinicId,
         unreadCount: { gt: 0 },
-        ...(doctorId
-          ? {
-              OR: [
-                { doctorId },
-                { doctorId: null },
-                { patient: { appointments: { some: { doctorId } } } },
-                { patient: { invoices: { some: { treatingDoctorId: doctorId } } } },
-              ],
-            }
-          : {}),
+        ...(doctorId ? conversationVisibleToDoctor(doctorId) : {}),
       },
       select: {
         id: true,
@@ -58,14 +50,7 @@ export class ConversationRepository {
     if (query.doctorId) {
       where.AND = [
         ...(where.AND || []),
-        {
-          OR: [
-            { doctorId: query.doctorId },
-            { doctorId: null },
-            { patient: { appointments: { some: { doctorId: query.doctorId } } } },
-            { patient: { invoices: { some: { treatingDoctorId: query.doctorId } } } },
-          ],
-        },
+        conversationVisibleToDoctor(query.doctorId),
       ];
     }
     if (query.search) {
@@ -109,12 +94,13 @@ export class ConversationRepository {
   }
 
   async findMessages(conversationId: string, clinicId: string, page: number, limit: number) {
-    return prisma.message.findMany({
+    const latest = await prisma.message.findMany({
       where: { conversationId, clinicId },
       skip: (page - 1) * limit,
       take: limit,
-      orderBy: { createdAt: 'asc' },
+      orderBy: { createdAt: 'desc' },
     });
+    return latest.reverse();
   }
 
   async resetUnreadCount(conversationId: string, clinicId: string) {
@@ -143,7 +129,7 @@ export class ConversationRepository {
           senderName: params.senderName,
           content: params.content,
           mediaUrl: params.mediaUrl,
-          status: 'SENT',
+          status: 'PENDING',
         },
       });
 
@@ -257,6 +243,7 @@ export class ConversationRepository {
     conversationId: string;
     content: string;
     recipientPhone?: string;
+    isAiGenerated?: boolean;
   }) {
     return prisma.$transaction(
       async (tx) => {
@@ -268,8 +255,8 @@ export class ConversationRepository {
             senderType: 'AI',
             senderName: 'CGS AI Receptionist',
             content: params.content,
-            status: 'SENT',
-            isAiGenerated: true,
+            status: 'PENDING',
+            isAiGenerated: params.isAiGenerated !== false,
           },
         });
 
@@ -289,9 +276,19 @@ export class ConversationRepository {
   }
 
   async updateConversation(id: string, clinicId: string, data: UpdateConversationDTO) {
-    return prisma.conversation.update({
-      where: { id },
-      data,
+    const dataWithHandoff =
+      data.state === 'AI_ACTIVE'
+        ? { ...data, handoffReason: null, lastActivityAt: new Date() }
+        : data;
+    const updated = await prisma.conversation.updateMany({
+      where: { id, clinicId },
+      data: dataWithHandoff,
+    });
+    if (!updated.count) {
+      return null;
+    }
+    return prisma.conversation.findFirst({
+      where: { id, clinicId },
       include: {
         patient: true,
         lead: true,
@@ -312,6 +309,14 @@ export class ConversationRepository {
   }) {
     const reasonPrefix = params.severity === 'critical' ? 'CRITICAL: ' : '';
     const handoffReason = `${reasonPrefix}${params.reason}`.slice(0, 500);
+
+    const owned = await prisma.conversation.findFirst({
+      where: { id: params.conversationId, clinicId: params.clinicId },
+      select: { id: true },
+    });
+    if (!owned) {
+      return null;
+    }
 
     const updated = await prisma.conversation.update({
       where: { id: params.conversationId },

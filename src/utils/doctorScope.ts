@@ -53,3 +53,15 @@ export async function resolveDoctorScope(params: {
     restrictToDoctorId,
   };
 }
+
+/** Same chat visibility for the dashboard and the conversations page. */
+export function conversationVisibleToDoctor(doctorId: string) {
+  return {
+    OR: [
+      { doctorId },
+      { doctorId: null },
+      { patient: { appointments: { some: { doctorId } } } },
+      { patient: { invoices: { some: { treatingDoctorId: doctorId } } } },
+    ],
+  };
+}

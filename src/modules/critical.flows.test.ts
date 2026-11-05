@@ -1,5 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { assertDoctorSlotAvailable, isSlotConflictError } from '../utils/appointmentSlot.js';
+import { assertDoctorSlotAvailable, filterSlotsForBookings, isSlotConflictError } from '../utils/appointmentSlot.js';
+import { pickBookableService } from '../utils/bookableService.js';
+import { conversationVisibleToDoctor } from '../utils/doctorScope.js';
 import { pickInboundConversation } from './internal/internal.repository.js';
 
 const mocks = vi.hoisted(() => ({
@@ -145,7 +147,10 @@ describe('appointment slots', () => {
     const tx = {
       $queryRaw: vi.fn(async () => [{ id: 'doctor-1' }]),
       doctor: { findFirst: vi.fn(async () => ({ maxBookingsPerSlot: 5 })) },
-      appointment: { count: vi.fn(async () => 4) },
+      appointment: {
+        count: vi.fn(async () => 4),
+        findFirst: vi.fn(async () => null),
+      },
     };
     await expect(
       assertDoctorSlotAvailable(tx as any, {
@@ -155,6 +160,44 @@ describe('appointment slots', () => {
         endsAt: new Date('2026-10-06T09:30:00+05:30'),
       })
     ).resolves.toBeUndefined();
+  });
+
+  it('rejects a different start that overlaps the booked duration', async () => {
+    const tx = {
+      $queryRaw: vi.fn(async () => [{ id: 'doctor-1' }]),
+      doctor: { findFirst: vi.fn(async () => ({ maxBookingsPerSlot: 5 })) },
+      appointment: {
+        count: vi.fn(async () => 0),
+        findFirst: vi.fn(async () => ({ id: 'apt-overlap' })),
+      },
+    };
+    await expect(
+      assertDoctorSlotAvailable(tx as any, {
+        clinicId: 'clinic-a',
+        doctorId: 'doctor-1',
+        startsAt: new Date('2026-10-06T09:15:00+05:30'),
+        endsAt: new Date('2026-10-06T09:45:00+05:30'),
+      })
+    ).rejects.toThrow('SLOT_ALREADY_BOOKED');
+  });
+
+  it('returns the existing appointment for the same patient after the doctor row is locked', async () => {
+    const existing = { id: 'apt-1', service: 'Consultation', status: 'CONFIRMED' };
+    const tx = {
+      $queryRaw: vi.fn(async () => [{ id: 'doctor-1' }]),
+      doctor: { findFirst: vi.fn() },
+      appointment: { findFirst: vi.fn(async () => existing), count: vi.fn() },
+    };
+    await expect(
+      assertDoctorSlotAvailable(tx as any, {
+        clinicId: 'clinic-a',
+        doctorId: 'doctor-1',
+        samePatientId: 'patient-1',
+        startsAt: new Date('2026-10-06T09:00:00+05:30'),
+        endsAt: new Date('2026-10-06T09:30:00+05:30'),
+      })
+    ).resolves.toEqual(existing);
+    expect(tx.appointment.count).not.toHaveBeenCalled();
   });
 
   it('rejects a doctor that is not in the clinic', async () => {
@@ -252,6 +295,76 @@ describe('invoice creation', () => {
         tax: 180,
         total: 1180,
       })
+    );
+  });
+});
+
+describe('service and slot rules', () => {
+  it('maps a generic consultation request onto the clinic consultation', () => {
+    const result = pickBookableService({
+      requested: 'General Consultation',
+      clinicServices: [{ id: 'svc-1', name: 'Consultation', durationMinutes: 20 }],
+      doctorLinkedServiceIds: null,
+    });
+    expect(result).toEqual({ ok: true, name: 'Consultation', durationMinutes: 20, serviceId: 'svc-1' });
+  });
+
+  it('rejects a service the clinic does not offer', () => {
+    const result = pickBookableService({
+      requested: 'Root Canal',
+      clinicServices: [{ id: 'svc-1', name: 'Consultation', durationMinutes: 20 }],
+      doctorLinkedServiceIds: null,
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.code).toBe('SERVICE_UNAVAILABLE');
+  });
+
+  it('rejects a doctor who is not linked to the service', () => {
+    const result = pickBookableService({
+      requested: 'Consultation',
+      clinicServices: [
+        { id: 'svc-1', name: 'Consultation', durationMinutes: 20 },
+        { id: 'svc-2', name: 'Cleaning', durationMinutes: 40 },
+      ],
+      doctorLinkedServiceIds: ['svc-2'],
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.code).toBe('SERVICE_NOT_OFFERED');
+  });
+
+  it('accepts a linked service and keeps its duration', () => {
+    const result = pickBookableService({
+      requested: 'cleaning',
+      clinicServices: [{ id: 'svc-2', name: 'Cleaning', durationMinutes: 40 }],
+      doctorLinkedServiceIds: ['svc-2'],
+    });
+    expect(result).toEqual({ ok: true, name: 'Cleaning', durationMinutes: 40, serviceId: 'svc-2' });
+  });
+
+  it('hides a later slot that overlaps a longer visit', () => {
+    const open = filterSlotsForBookings({
+      slots: ['09:00 AM', '09:30 AM', '10:00 AM'],
+      slotMinutes: 30,
+      capacity: 1,
+      timeZone: 'Asia/Kolkata',
+      booked: [
+        {
+          startsAt: new Date('2026-10-06T09:00:00+05:30'),
+          endsAt: new Date('2026-10-06T10:00:00+05:30'),
+        },
+      ],
+    });
+    expect(open).toEqual(['10:00 AM']);
+  });
+
+  it('uses the same doctor visibility on the dashboard and the conversation list', () => {
+    const filter = conversationVisibleToDoctor('doctor-a');
+    expect(filter.OR).toEqual(
+      expect.arrayContaining([
+        { doctorId: 'doctor-a' },
+        { doctorId: null },
+        { patient: { invoices: { some: { treatingDoctorId: 'doctor-a' } } } },
+      ])
     );
   });
 });

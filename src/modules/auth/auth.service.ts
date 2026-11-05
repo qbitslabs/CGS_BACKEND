@@ -2,6 +2,7 @@
  * Clinic API layer for auth; talks Prisma or callers, not the AI database. */
 import bcrypt from 'bcryptjs';
 import { authRepository, AuthRepository } from './auth.repository.js';
+import { outboundAllowed } from '../admin/entitlements.js';
 import { AuthResponseDTO, AuthUserProfileDTO, LoginDTO } from './auth.types.js';
 import { AppError } from '../../middleware/errorHandler.js';
 import { logAuditEvent } from '../../middleware/audit.js';
@@ -130,6 +131,7 @@ export class AuthService {
         doctorId: scope.doctorId || undefined,
         isPrimaryDoctor: scope.isPrimary,
         seesAllClinicData: scope.seesAllClinicData,
+        outboundAllowed: await outboundAllowed(user.clinicId),
       },
     };
   }
@@ -203,6 +205,7 @@ export class AuthService {
       doctorId: scope.doctorId || undefined,
       isPrimaryDoctor: scope.isPrimary,
       seesAllClinicData: scope.seesAllClinicData,
+      outboundAllowed: await outboundAllowed(user.clinicId),
       permissions,
     };
   }

@@ -36,6 +36,10 @@ router.patch('/clinics/:id/whatsapp-token', adminController.replaceWhatsAppToken
 router.patch('/clinics/:id/ai-config', adminController.updateClinicAiConfig);
 router.post('/clinics/:id/users', adminController.addClinicUser);
 router.patch('/clinics/:id/primary-doctor', adminController.setPrimaryDoctor);
+router.patch('/clinics/:id/subscription', adminController.assignClinicPlan);
+router.post('/clinics/:id/addons', adminController.recordClinicAddon);
+router.post('/clinics/:id/addons/:addonId/confirm', adminController.confirmClinicAddon);
+router.delete('/clinics/:id/addons/:addonId', adminController.removeClinicAddon);
 
 router.get('/users', adminController.getUsers);
 
@@ -51,6 +55,8 @@ router.get('/ai/conversations/:id', adminController.getAiConversationById);
 router.get('/plans', adminController.getPlans);
 router.get('/subscriptions', adminController.getSubscriptions);
 router.get('/invoices', adminController.getInvoices);
+router.post('/invoices', adminController.createOneTimeInvoice);
+router.get('/invoices/:id/pdf', adminController.downloadInvoicePdf);
 
 router.get('/whatsapp', adminController.getWhatsappHealth);
 router.get('/jobs', adminController.getJobs);

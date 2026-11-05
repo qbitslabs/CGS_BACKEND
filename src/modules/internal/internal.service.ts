@@ -17,6 +17,8 @@ import { prisma } from '../../config/db.js';
 import { conversationService } from '../conversations/conversation.service.js';
 import { decryptToken } from '../../utils/crypto.js';
 import { env } from '../../config/env.js';
+import { pickBookableService } from '../../utils/bookableService.js';
+import { filterSlotsForBookings } from '../../utils/appointmentSlot.js';
 import {
   clinicCalendarUtcDate,
   clinicDayBoundsUtc,
@@ -25,6 +27,18 @@ import {
   dropPastSlots,
   resolveClinicTimezone,
 } from '../../utils/timezone.js';
+
+function nextDeliveryStatus(
+  current: string,
+  incoming: 'SENT' | 'DELIVERED' | 'READ' | 'FAILED'
+): 'SENT' | 'DELIVERED' | 'READ' | 'FAILED' | null {
+  if (incoming === 'FAILED') {
+    return current === 'PENDING' || current === 'SENT' ? 'FAILED' : null;
+  }
+  const rank: Record<string, number> = { PENDING: 0, SENT: 1, DELIVERED: 2, READ: 3 };
+  if ((rank[incoming] ?? 0) > (rank[current] ?? 0)) return incoming;
+  return null;
+}
 
 function formatDoctorName(firstName?: string | null, lastName?: string | null) {
   const full = `${firstName || ''} ${lastName || ''}`.trim();
@@ -155,7 +169,47 @@ export class InternalService {
       payload: dto.payload,
     });
 
+    await this.applyWhatsAppDeliveryStatuses(dto.payload, account?.clinicId);
+
     return { eventId: event.id, status: event.status };
+  }
+
+  private async applyWhatsAppDeliveryStatuses(payload: unknown, clinicId?: string) {
+    const body = payload as {
+      entry?: Array<{
+        changes?: Array<{ value?: { statuses?: Array<{ id?: string; status?: string }> } }>;
+      }>;
+    };
+    for (const entry of body?.entry || []) {
+      for (const change of entry?.changes || []) {
+        for (const row of change?.value?.statuses || []) {
+          const providerMessageId = row?.id;
+          const next = this.mapMetaDeliveryStatus(row?.status || '');
+          if (!providerMessageId || !next) continue;
+          const current = await prisma.message.findFirst({
+            where: {
+              providerMessageId,
+              ...(clinicId ? { clinicId } : {}),
+            },
+            select: { id: true, status: true },
+          });
+          if (!current) continue;
+          const advanced = nextDeliveryStatus(current.status, next);
+          if (advanced) {
+            await prisma.message.update({ where: { id: current.id }, data: { status: advanced } });
+          }
+        }
+      }
+    }
+  }
+
+  private mapMetaDeliveryStatus(raw: string): 'SENT' | 'DELIVERED' | 'READ' | 'FAILED' | null {
+    const value = raw.toLowerCase();
+    if (value === 'sent') return 'SENT';
+    if (value === 'delivered') return 'DELIVERED';
+    if (value === 'read') return 'READ';
+    if (value === 'failed') return 'FAILED';
+    return null;
   }
 
   async handleWhatsAppInbound(dto: WhatsAppInboundMessageDTO) {
@@ -436,7 +490,16 @@ export class InternalService {
       bookedCountBySlot.set(label, (bookedCountBySlot.get(label) || 0) + 1);
     }
     const availableSlots = dropPastSlots(
-      standardSlots.filter((slot) => (bookedCountBySlot.get(slot) || 0) < capacity),
+      filterSlotsForBookings({
+        slots: standardSlots.filter((slot) => (bookedCountBySlot.get(slot) || 0) < capacity),
+        slotMinutes: 30,
+        capacity,
+        booked: bookedAppointments.map((row) => ({
+          startsAt: new Date(row.startsAt),
+          endsAt: new Date(row.endsAt),
+        })),
+        timeZone,
+      }),
       dateKey,
       timeZone
     );
@@ -503,6 +566,49 @@ export class InternalService {
     }
 
     return Array.from(new Set(generatedSlots));
+  }
+
+  private async resolveBookableService(clinicId: string, doctorId: string | undefined, requested: string) {
+    const clinicServices = await prisma.service.findMany({
+      where: { clinicId, isActive: true },
+      select: { id: true, name: true, durationMinutes: true },
+    });
+    let doctorLinkedServiceIds: string[] | null = null;
+    if (doctorId) {
+      const links = await prisma.doctorService.findMany({
+        where: { clinicId, doctorId, isActive: true },
+        select: { serviceId: true },
+      });
+      doctorLinkedServiceIds = links.map((row) => row.serviceId);
+    }
+    const picked = pickBookableService({
+      requested,
+      clinicServices,
+      doctorLinkedServiceIds,
+    });
+    if (!picked.ok) {
+      throw new AppError(picked.message, 400, picked.code);
+    }
+    return picked;
+  }
+
+  /** Reschedule keeps a legacy service name. A catalog match must still be offered by the doctor. */
+  private async assertDoctorOffersNamedService(clinicId: string, doctorId: string, serviceName: string) {
+    const clinicServices = await prisma.service.findMany({
+      where: { clinicId, isActive: true },
+      select: { id: true, name: true },
+    });
+    const match = clinicServices.find(
+      (row) => row.name.trim().toLowerCase() === serviceName.trim().toLowerCase()
+    );
+    if (!match) return;
+    const links = await prisma.doctorService.findMany({
+      where: { clinicId, doctorId, isActive: true },
+      select: { serviceId: true },
+    });
+    if (links.length && !links.some((row) => row.serviceId === match.id)) {
+      throw new AppError(`This doctor does not offer ${match.name}.`, 400, 'SERVICE_NOT_OFFERED');
+    }
   }
 
   async bookAppointment(dto: AIBookAppointmentDTO) {
@@ -581,16 +687,19 @@ export class InternalService {
 
     // Store appointment in IST wall-clock so UI/AI show the same time the patient booked.
     const startsAt = new Date(`${dto.date}T${formattedTime}+05:30`);
-    const endsAt = new Date(startsAt.getTime() + 30 * 60000);
+    const offered = await this.resolveBookableService(dto.clinicId, doctorId, dto.service || 'General Consultation');
+    const endsAt = new Date(startsAt.getTime() + offered.durationMinutes * 60000);
 
     const result = await this.repo.bookAppointmentInTx({
       clinicId: dto.clinicId,
       patientPhone: dto.patientPhone,
       patientName: dto.patientName,
       doctorId,
-      service: dto.service || 'General Consultation',
+      service: offered.name,
+      serviceId: offered.serviceId,
       startsAt,
       endsAt,
+      durationMinutes: offered.durationMinutes,
       notes: dto.notes,
       date: dto.date,
       time: dto.time,
@@ -727,6 +836,10 @@ export class InternalService {
       }
     } else if (formattedTime.length === 5) {
       formattedTime = `${formattedTime}:00`;
+    }
+
+    if (doctorId && existing.service) {
+      await this.assertDoctorOffersNamedService(dto.clinicId, doctorId, existing.service);
     }
 
     const startsAt = new Date(`${dto.date}T${formattedTime}+05:30`);

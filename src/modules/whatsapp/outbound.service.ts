@@ -1,6 +1,7 @@
 /* Queue global template sends. One job per recipient. Does not start the AI. */
 import { prisma } from '../../config/db.js';
 import { env } from '../../config/env.js';
+import { automationAllowed } from '../admin/entitlements.js';
 import { AppError } from '../../middleware/errorHandler.js';
 import { decryptToken } from '../../utils/crypto.js';
 import { phoneMatchVariants } from '../../utils/phoneMatch.js';
@@ -20,6 +21,15 @@ import {
   kolkataDay,
   shouldSkipAcceptedSend,
 } from './whatsappTemplates.js';
+
+const TEMPLATE_AUTOMATION: Record<string, string> = {
+  LANDING_ENQUIRY: 'NEW_ENQUIRY',
+  BILL: 'INVOICE_WHATSAPP',
+  REMINDER: 'APPOINTMENT_REMINDER',
+  MISSED_APPOINTMENT: 'MISSED_APPOINTMENT',
+  FOLLOWUP: 'COMPLETED_VISIT',
+  OLD_PATIENT_REACTIVATION: 'PATIENT_REACTIVATION',
+};
 
 type RecipientInput = {
   appointmentIds?: string[];
@@ -41,6 +51,7 @@ type ResolvedSend = {
   doctorId?: string;
   parameters: string[];
   preview: string;
+  appointmentStartsAt?: string;
 };
 
 function doctorName(doctor?: { user?: { firstName?: string | null; lastName?: string | null } | null } | null): string {
@@ -145,6 +156,7 @@ async function resolveOne(
       patientId: appointment.patient.id,
       parameters,
       preview: fillTemplatePreview(template.bodyText, parameters),
+      appointmentStartsAt: appointment.startsAt.toISOString(),
     };
   }
 
@@ -300,6 +312,14 @@ async function sendAlreadyAccepted(
 
 export async function queueTemplateSends(clinicId: string, templateKey: string, input: RecipientInput) {
   const template = findTemplate(templateKey);
+  const automationKey = TEMPLATE_AUTOMATION[template.key];
+  if (automationKey && !(await automationAllowed(clinicId, automationKey))) {
+    return {
+      template: publicTemplate(template),
+      queued: [],
+      skipped: [{ recordId: '', phone: '', reason: 'PLAN' }],
+    };
+  }
   const account = await prisma.whatsappAccount.findFirst({
     where: { clinicId, isActive: true },
   });
@@ -337,6 +357,21 @@ export async function queueTemplateSends(clinicId: string, templateKey: string, 
     }
 
     const created = await prisma.$transaction(async (tx) => {
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${key}))`;
+      const raced = await tx.job.findFirst({
+        where: {
+          clinicId,
+          type: WHATSAPP_TEMPLATE_SEND_JOB,
+          status: { in: ['PENDING', 'PROCESSING', 'COMPLETED'] },
+          payload: { path: ['idempotencyKey'], equals: key },
+        },
+        orderBy: { createdAt: 'desc' },
+        select: { id: true, status: true, payload: true },
+      });
+      if (raced && (await sendAlreadyAccepted(clinicId, raced))) {
+        return null;
+      }
+
       let conversation = await tx.conversation.findFirst({
         where: { clinicId, participantPhone: { in: phoneMatchVariants(resolved.phone) } },
         orderBy: { lastActivityAt: 'desc' },
@@ -399,6 +434,8 @@ export async function queueTemplateSends(clinicId: string, templateKey: string, 
             messageId: message.id,
             conversationId: conversation.id,
             idempotencyKey: key,
+            recordId: resolved.recordId,
+            ...(resolved.appointmentStartsAt ? { appointmentStartsAt: resolved.appointmentStartsAt } : {}),
             recipientPhone: resolved.phone,
             templateKey: template.key,
             templateName: template.metaName,
@@ -412,6 +449,11 @@ export async function queueTemplateSends(clinicId: string, templateKey: string, 
       });
       return { messageId: message.id, conversationId: conversation.id, jobId: job.id };
     });
+
+    if (!created) {
+      skipped.push({ recordId: resolved.recordId, phone: resolved.phone, reason: 'DUPLICATE' });
+      continue;
+    }
 
     queued.push({ ...created, phone: resolved.phone, preview: resolved.preview });
   }
@@ -448,6 +490,7 @@ async function postGateway(body: Record<string, unknown>): Promise<GatewayResult
       'Content-Type': 'application/json',
       'X-Service-Key': env.INTERNAL_SERVICE_SECRET,
     },
+    signal: AbortSignal.timeout(30_000),
     body: JSON.stringify(body),
   });
   const data = (await response.json().catch(() => ({}))) as {
@@ -482,6 +525,8 @@ export async function executeTemplateSendJob(job: {
     trySessionFirst?: boolean;
     sessionText?: string;
     invoiceId?: string;
+    recordId?: string;
+    appointmentStartsAt?: string;
   };
 }) {
   const clinicId = job.clinicId;
@@ -499,7 +544,39 @@ export async function executeTemplateSendJob(job: {
 
   const parameters = (payload.parameters || []).map((item) => String(item));
   const template = findTemplate(String((payload as { templateKey?: string }).templateKey || ''));
+  const automationKey = TEMPLATE_AUTOMATION[template.key];
+  if (automationKey && !(await automationAllowed(clinicId, automationKey))) {
+    await markTemplateSendFailed(message.id, clinicId);
+    return 'skipped' as const;
+  }
   assertTemplateUsable(template, parameters);
+
+  if (template.recipientKind === 'appointment' && payload.recordId) {
+    const appointment = await prisma.appointment.findFirst({
+      where: { id: payload.recordId, clinicId },
+      select: { status: true, startsAt: true, endsAt: true },
+    });
+    const status = appointment?.status;
+    const queuedStart = payload.appointmentStartsAt;
+    const moved =
+      queuedStart != null &&
+      appointment != null &&
+      appointment.startsAt.getTime() !== new Date(queuedStart).getTime();
+    const skip =
+      !appointment ||
+      status === 'CANCELLED' ||
+      (template.key === 'REMINDER' &&
+        (status !== 'SCHEDULED' && status !== 'CONFIRMED' || moved || appointment.startsAt.getTime() <= Date.now())) ||
+      (template.key === 'FOLLOWUP' && status !== 'COMPLETED') ||
+      (template.key === 'MISSED_APPOINTMENT' &&
+        (status === 'COMPLETED' ||
+          moved ||
+          (status !== 'NO_SHOW' && appointment.endsAt.getTime() > Date.now())));
+    if (skip) {
+      await markTemplateSendFailed(message.id, clinicId);
+      return;
+    }
+  }
 
   const account = await prisma.whatsappAccount.findFirst({
     where: { clinicId, isActive: true },

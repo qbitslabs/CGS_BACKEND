@@ -4,6 +4,10 @@ const db = vi.hoisted(() => ({
   sessions: [] as Array<Record<string, any>>,
 }));
 
+vi.mock('../admin/entitlements.js', () => ({
+  outboundAllowed: vi.fn(async () => true),
+}));
+
 vi.mock('../../config/db.js', () => ({
   prisma: {
     staffRefreshSession: {

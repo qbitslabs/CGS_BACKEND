@@ -16,7 +16,11 @@ export class LeadService {
       name: l.name,
       phone: l.phone,
       email: l.email || undefined,
-      source: l.source ? l.source.charAt(0) + l.source.slice(1).toLowerCase().replace('_', ' ') : 'WhatsApp',
+      source: l.source === 'WALK_IN'
+        ? 'Walk-in'
+        : l.source
+          ? l.source.charAt(0) + l.source.slice(1).toLowerCase().replace('_', ' ')
+          : 'WhatsApp',
       status:
         l.status === 'CONVERTED'
           ? 'Booked'

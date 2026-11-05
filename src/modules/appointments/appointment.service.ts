@@ -5,7 +5,9 @@ import { AppointmentListQuery, CreateAppointmentDTO, UpdateAppointmentDTO } from
 import { patientRepository } from '../patients/patient.repository.js';
 import { prisma } from '../../config/db.js';
 import { AppError } from '../../middleware/errorHandler.js';
+import { filterSlotsForBookings } from '../../utils/appointmentSlot.js';
 import { logAuditEvent } from '../../middleware/audit.js';
+import { phoneMatchVariants } from '../../utils/phoneMatch.js';
 import {
   clinicCalendarUtcDate,
   clinicDateString,
@@ -226,16 +228,6 @@ export class AppointmentService {
         actorName: auditContext.actorName || 'Staff',
       });
 
-      // Auto-convert lead to patient if appointment is created directly as COMPLETED
-      if ((dto as any).status === 'COMPLETED') {
-        await this.autoConvertLeadOnAppointmentDone(
-          clinicId,
-          dto.patientId,
-          dto.service || 'Consultation',
-          auditContext.actorName || 'Staff'
-        );
-      }
-
       await logAuditEvent({
         clinicId,
         userId: auditContext.userId,
@@ -330,17 +322,20 @@ export class AppointmentService {
       }
     }
 
-    const updated = await this.repo.update(id, updateData);
-
-    // Auto-flow: When appointment is marked COMPLETED / Done, automatically convert linked lead to patient
     if (updateData.status === 'COMPLETED') {
-      await this.autoConvertLeadOnAppointmentDone(
+      const linkedPatientId = await this.autoConvertLeadOnAppointmentDone(
         clinicId,
         existing.patientId,
         existing.service || 'Consultation',
-        auditContext.actorName || 'System Automated Flow'
+        auditContext.actorName || 'System Automated Flow',
+        existing.id
       );
+      if (linkedPatientId && linkedPatientId !== existing.patientId) {
+        updateData.patientId = linkedPatientId;
+      }
     }
+
+    const updated = await this.repo.update(id, updateData);
 
     await logAuditEvent({
       clinicId,
@@ -365,100 +360,119 @@ export class AppointmentService {
     clinicId: string,
     patientId: string,
     appointmentService: string,
-    actorName: string
+    actorName: string,
+    appointmentId?: string
   ) {
-    try {
-      let patient = await prisma.patient.findUnique({
-        where: { id: patientId },
+    const owned = await prisma.patient.findFirst({
+      where: { id: patientId, clinicId },
+    });
+
+    let patient = owned;
+    if (!patient) {
+      const lead = await prisma.lead.findFirst({
+        where: { id: patientId, clinicId },
       });
-
-      if (!patient) {
-        const lead = await prisma.lead.findFirst({
-          where: { id: patientId, clinicId },
-        });
-        if (lead) {
-          patient = await prisma.patient.findFirst({
-            where: { clinicId, phone: lead.phone },
-          });
-          if (!patient) {
-            patient = await prisma.patient.create({
-              data: {
-                clinicId,
-                name: lead.name,
-                phone: lead.phone,
-                email: lead.email,
-                medicalHistoryNotes: lead.notes,
-                leadId: lead.id,
-                status: 'ACTIVE',
-              },
-            });
-          }
-          await prisma.appointment.updateMany({
-            where: { patientId: lead.id },
-            data: { patientId: patient.id },
-          });
-        }
+      if (!lead?.phone) {
+        throw new AppError(
+          'This appointment has no patient in this clinic. Choose the patient before completing it.',
+          409,
+          'PATIENT_LINK_REQUIRED'
+        );
       }
-
-      if (!patient) return;
-
-      // Find any lead belonging to clinic with matching phone or linked patient ID
-      const matchingLead = await prisma.lead.findFirst({
+      const matches = await prisma.patient.findMany({
+        where: { clinicId, phone: { in: phoneMatchVariants(lead.phone) } },
+        take: 3,
+      });
+      if (matches.length > 1) {
+        throw new AppError(
+          'More than one patient uses this phone number. Choose the patient before completing the visit.',
+          409,
+          'PATIENT_AMBIGUOUS'
+        );
+      }
+      patient = matches[0];
+      if (!patient) {
+        const variants = phoneMatchVariants(lead.phone);
+        patient = await prisma.patient.create({
+          data: {
+            clinicId,
+            name: lead.name,
+            phone: variants.find((p) => p.startsWith('91') && p.length === 12) || variants[0] || lead.phone,
+            email: lead.email,
+            medicalHistoryNotes: lead.notes,
+            leadId: lead.id,
+            status: 'ACTIVE',
+          },
+        });
+      }
+      await prisma.appointment.updateMany({
         where: {
           clinicId,
-          OR: [
-            { convertedPatientId: patient.id },
-            { phone: patient.phone },
-            ...(patient.leadId ? [{ id: patient.leadId }] : []),
-          ],
-          status: { not: 'CONVERTED' },
+          OR: [{ id: appointmentId || '' }, { patientId: lead.id }],
         },
+        data: { patientId: patient.id },
       });
-
-      if (matchingLead) {
-        await prisma.$transaction([
-          prisma.lead.update({
-            where: { id: matchingLead.id },
-            data: {
-              status: 'CONVERTED',
-              convertedPatientId: patient.id,
-            },
-          }),
-          prisma.patient.update({
-            where: { id: patient.id },
-            data: {
-              leadId: matchingLead.id,
-              status: 'ACTIVE',
-            },
-          }),
-          prisma.leadActivity.create({
-            data: {
-              leadId: matchingLead.id,
-              type: 'status_change',
-              title: 'Auto-Converted to Patient',
-              description: `Lead automatically converted into permanent patient upon appointment completion (${appointmentService}).`,
-              actor: actorName,
-            },
-          }),
-          prisma.patientActivity.create({
-            data: {
-              patientId: patient.id,
-              type: 'appointment',
-              title: 'Appointment Completed',
-              description: `Completed treatment / consultation for ${appointmentService}.`,
-              actor: actorName,
-            },
-          }),
-          prisma.conversation.updateMany({
-            where: { leadId: matchingLead.id },
-            data: { patientId: patient.id },
-          }),
-        ]);
-        console.log(`[Auto-Flow] Lead ${matchingLead.id} (${matchingLead.name}) automatically converted to Patient upon appointment completion.`);
-      }
-    } catch (err: any) {
-      console.error('[Auto-Flow] Error auto-converting lead on appointment completion:', err.message);
     }
+
+    const matchingLeads = await prisma.lead.findMany({
+      where: {
+        clinicId,
+        status: { not: 'CONVERTED' },
+        OR: [
+          { convertedPatientId: patient.id },
+          { phone: { in: phoneMatchVariants(patient.phone) } },
+          ...(patient.leadId ? [{ id: patient.leadId }] : []),
+        ],
+      },
+      take: 3,
+    });
+    const matchingLead =
+      matchingLeads.find((lead) => lead.id === patient.leadId) ||
+      (matchingLeads.length === 1 ? matchingLeads[0] : undefined);
+
+    if (matchingLead) {
+      await prisma.$transaction([
+        prisma.lead.update({
+          where: { id: matchingLead.id },
+          data: {
+            status: 'CONVERTED',
+            convertedPatientId: patient.id,
+          },
+        }),
+        ...(patient.leadId
+          ? []
+          : [
+              prisma.patient.update({
+                where: { id: patient.id },
+                data: { leadId: matchingLead.id },
+              }),
+            ]),
+        prisma.leadActivity.create({
+          data: {
+            leadId: matchingLead.id,
+            type: 'status_change',
+            title: 'Auto-Converted to Patient',
+            description: `Lead automatically converted into permanent patient upon appointment completion (${appointmentService}).`,
+            actor: actorName,
+          },
+        }),
+        prisma.patientActivity.create({
+          data: {
+            patientId: patient.id,
+            type: 'appointment',
+            title: 'Appointment Completed',
+            description: `Completed treatment / consultation for ${appointmentService}.`,
+            actor: actorName,
+          },
+        }),
+        prisma.conversation.updateMany({
+          where: { clinicId, leadId: matchingLead.id },
+          data: { patientId: patient.id },
+        }),
+      ]);
+    }
+
+    return patient.id;
   }
 
   async getDoctorAvailability(clinicId: string, doctorId?: string, dateStr?: string) {
@@ -551,7 +565,7 @@ export class AppointmentService {
 
     const bookedAppointments = await prisma.appointment.findMany({
       where: appointmentWhere,
-      select: { startsAt: true },
+      select: { startsAt: true, endsAt: true },
     });
 
     const capacity = Math.min(20, Math.max(1, doctor?.maxBookingsPerSlot || 1));
@@ -562,7 +576,13 @@ export class AppointmentService {
     }
     const bookedSlots = [...bookedCountBySlot.entries()].filter(([, count]) => count >= capacity).map(([label]) => label);
     const availableSlots = dropPastSlots(
-      allSlots.filter((slot) => (bookedCountBySlot.get(slot) || 0) < capacity),
+      filterSlotsForBookings({
+        slots: allSlots.filter((slot) => (bookedCountBySlot.get(slot) || 0) < capacity),
+        slotMinutes: 30,
+        capacity,
+        booked: bookedAppointments,
+        timeZone,
+      }),
       cleanDateStr,
       timeZone
     );

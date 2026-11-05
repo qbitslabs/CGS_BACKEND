@@ -40,6 +40,19 @@ function timezoneOffsetMs(date: Date, timeZone: string): number {
   return asUtc - date.getTime();
 }
 
+/** Calendar month in the clinic timezone, from day 1 through 28, 29, 30, or 31. */
+export function clinicMonthWindow(now = new Date(), timeZone: string = DEFAULT_CLINIC_TIMEZONE) {
+  const today = clinicDateString(now, timeZone);
+  const [yearText, monthText] = today.split('-');
+  const year = Number(yearText);
+  const month = Number(monthText);
+  const toDay = new Date(Date.UTC(year, month, 0)).getUTCDate();
+  const start = clinicDayBoundsUtc(`${yearText}-${monthText}-01`, timeZone).start;
+  const end = clinicDayBoundsUtc(`${yearText}-${monthText}-${String(toDay).padStart(2, '0')}`, timeZone).end;
+  const monthLabel = new Intl.DateTimeFormat('en-IN', { timeZone, month: 'long', year: 'numeric' }).format(now);
+  return { start, end, fromDay: 1, toDay, monthLabel };
+}
+
 /** Inclusive UTC bounds for a YYYY-MM-DD calendar day in the clinic timezone. */
 export function clinicDayBoundsUtc(
   dateStr: string,

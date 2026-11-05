@@ -1,6 +1,8 @@
 /* CGS dashboard module — business logic.
  * Clinic API layer for dashboard; talks Prisma or callers, not the AI database. */
 import { prisma } from '../../config/db.js';
+import { clinicPackageUsage } from '../admin/entitlements.js';
+import { conversationVisibleToDoctor } from '../../utils/doctorScope.js';
 import {
   clinicDateString,
   clinicDayBoundsUtc,
@@ -76,26 +78,20 @@ export class DashboardService {
       prisma.conversation.count({
         where: {
           clinicId,
-          ...(doctorId
-            ? { OR: [{ doctorId }, { patient: { appointments: { some: { doctorId } } } }] }
-            : {}),
+          ...(doctorId ? conversationVisibleToDoctor(doctorId) : {}),
         },
       }),
       prisma.conversation.count({
         where: {
           clinicId,
           OR: [{ unreadCount: { gt: 0 } }, { state: { in: ['AI_ACTIVE', 'HANDOFF_PENDING'] } }],
-          ...(doctorId
-            ? { AND: [{ OR: [{ doctorId }, { patient: { appointments: { some: { doctorId } } } }] }] }
-            : {}),
+          ...(doctorId ? { AND: [conversationVisibleToDoctor(doctorId)] } : {}),
         },
       }),
       prisma.conversation.findMany({
         where: {
           clinicId,
-          ...(doctorId
-            ? { OR: [{ doctorId }, { patient: { appointments: { some: { doctorId } } } }] }
-            : {}),
+          ...(doctorId ? conversationVisibleToDoctor(doctorId) : {}),
         },
         select: {
           id: true,
@@ -202,6 +198,33 @@ export class DashboardService {
       todayAppointments,
       recentConversations,
       activities,
+      plan: await this.planCard(clinicId),
+    };
+  }
+
+  private async planCard(clinicId: string) {
+    const [subscription, usage] = await Promise.all([
+      prisma.cgsSubscription.findFirst({
+        where: { clinicId },
+        orderBy: { createdAt: 'desc' },
+        include: { plan: true },
+      }),
+      clinicPackageUsage(clinicId),
+    ]);
+    const monthlyPrice = subscription
+      ? Number(subscription.earlyBird ? subscription.plan.earlyBirdMonthlyPrice : subscription.plan.regularMonthlyPrice)
+      : null;
+    return {
+      name: subscription?.plan.name || null,
+      monthlyPrice,
+      status: subscription?.status || null,
+      earlyBird: Boolean(subscription?.earlyBird),
+      enforced: usage.enforced,
+      doctors: usage.doctors,
+      staff: usage.staff,
+      whatsappNumbers: usage.whatsappNumbers,
+      aiReplies: usage.aiReplies,
+      whatsappMessages: usage.whatsappMessages,
     };
   }
 }

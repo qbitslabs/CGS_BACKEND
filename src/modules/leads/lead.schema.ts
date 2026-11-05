@@ -17,7 +17,10 @@ export const createLeadSchema = z.object({
   name: z.string().min(1),
   phone: z.string().min(8),
   email: z.string().email().optional().or(z.literal('')),
-  source: z.enum(['WHATSAPP', 'WEBSITE', 'GOOGLE_AD', 'INSTAGRAM', 'WALK_IN', 'REFERRAL']).default('WHATSAPP'),
+  source: z.preprocess(
+    (val) => (typeof val === 'string' ? val.trim().toUpperCase().replace(/[\s-]+/g, '_') : val),
+    z.enum(['WHATSAPP', 'WEBSITE', 'GOOGLE_AD', 'INSTAGRAM', 'WALK_IN', 'REFERRAL']).default('WHATSAPP')
+  ),
   interestedService: z.string().optional(),
   preferredDoctor: z.string().optional(),
   howHeardAboutDoctor: z.string().optional(),

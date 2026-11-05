@@ -142,36 +142,39 @@ export async function ensureOutboundSchedulerJobs() {
 }
 
 async function ensureSchedulerJob(type: string) {
-  const live = await prisma.job.findFirst({
-    where: { type, status: { in: ['PENDING', 'PROCESSING'] } },
-    select: { id: true },
-  });
-  if (live) return;
-  const previous = await prisma.job.findFirst({
-    where: { type },
-    orderBy: { updatedAt: 'desc' },
-    select: { payload: true },
-  });
-  const previousRanAt =
-    previous?.payload &&
-    typeof previous.payload === 'object' &&
-    !Array.isArray(previous.payload) &&
-    typeof previous.payload.previousRanAt === 'string'
-      ? previous.payload.previousRanAt
-      : undefined;
-  await prisma.job.create({
-    data: {
-      queue: SCHEDULER_QUEUE,
-      type,
-      status: 'PENDING',
-      availableAt: new Date(),
-      maxAttempts: 5,
-      payload: {
-        note: previousRanAt
-          ? 'Restarted after the last run failed. This run catches up from that time.'
-          : 'Waiting for the first run. If the server was down, this run catches up.',
-        ...(previousRanAt ? { previousRanAt } : {}),
+  await prisma.$transaction(async (tx) => {
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`scheduler:${type}`}))`;
+    const live = await tx.job.findFirst({
+      where: { type, status: { in: ['PENDING', 'PROCESSING'] } },
+      select: { id: true },
+    });
+    if (live) return;
+    const previous = await tx.job.findFirst({
+      where: { type },
+      orderBy: { updatedAt: 'desc' },
+      select: { payload: true },
+    });
+    const previousRanAt =
+      previous?.payload &&
+      typeof previous.payload === 'object' &&
+      !Array.isArray(previous.payload) &&
+      typeof previous.payload.previousRanAt === 'string'
+        ? previous.payload.previousRanAt
+        : undefined;
+    await tx.job.create({
+      data: {
+        queue: SCHEDULER_QUEUE,
+        type,
+        status: 'PENDING',
+        availableAt: new Date(),
+        maxAttempts: 5,
+        payload: {
+          note: previousRanAt
+            ? 'Restarted after the last run failed. This run catches up from that time.'
+            : 'Waiting for the first run. If the server was down, this run catches up.',
+          ...(previousRanAt ? { previousRanAt } : {}),
+        },
       },
-    },
+    });
   });
 }

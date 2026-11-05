@@ -17,8 +17,12 @@ import { env } from '../../config/env.js';
 import { logAuditEvent } from '../../middleware/audit.js';
 import { auditService } from '../audit/audit.service.js';
 import { assertClinicSeatAvailable } from '../../utils/subscriptionSeats.js';
+import { assertCanAddDoctor, assertCanAddStaff, assertCanAddWhatsappNumber, clinicPackageUsage } from './entitlements.js';
+import { addonOffer, assertEarlyBirdAvailable, packageMonthlyAmount } from './planCatalog.js';
 import { encryptToken } from '../../utils/crypto.js';
 import { queueTemplateSends } from '../whatsapp/outbound.service.js';
+import { buildSubscriptionInvoicePdf, subscriptionInvoiceFilename } from './subscriptionInvoicePdf.js';
+import { gstOn } from './subscriptionGst.js';
 
 function jobText(value: unknown): string | undefined {
   if (value === undefined || value === null || value === '') return undefined;
@@ -52,6 +56,18 @@ function describeJob(type: string, payload: unknown): Array<{ label: string; val
     pushJobDetail(rows, 'Visits checked', source.checked);
     pushJobDetail(rows, 'Messages queued', source.queued);
     pushJobDetail(rows, 'Last check', source.previousRanAt);
+  } else if (type === 'SUBSCRIPTION_BILL_SCAN') {
+    pushJobDetail(rows, 'Summary', source.note);
+    pushJobDetail(rows, 'Clinics', source.clinics);
+    pushJobDetail(rows, 'Bills queued', source.queued);
+    pushJobDetail(rows, 'Already billed', source.alreadyBilled);
+    pushJobDetail(rows, 'Last check', source.previousRanAt);
+  } else if (type === 'SUBSCRIPTION_BILL_CREATE') {
+    pushJobDetail(rows, 'Summary', source.note);
+    pushJobDetail(rows, 'Invoice', source.invoiceNumber);
+    pushJobDetail(rows, 'Amount', source.total);
+    pushJobDetail(rows, 'Period start', source.periodStart);
+    pushJobDetail(rows, 'Period end', source.periodEnd);
   } else if (type === 'OUTBOUND_OUTCOME_SCAN') {
     pushJobDetail(rows, 'Summary', source.note);
     pushJobDetail(rows, 'Missed visits', source.missed);
@@ -447,7 +463,148 @@ export class AdminService {
       throw new AppError('Clinic not found', 404, 'NOT_FOUND');
     }
     const usage = await this.repo.getClinicUsageSummary(id);
-    return this.mapClinicDetail(clinic, usage);
+    const runtime = await this.fetchAiRuntime();
+    const packageUsage = await clinicPackageUsage(id);
+    const seats = {
+      enforced: packageUsage.enforced,
+      planName: packageUsage.planName,
+      tier: packageUsage.tier,
+      doctors: { used: packageUsage.doctors.used, allowed: packageUsage.doctors.allowed },
+      staff: { used: packageUsage.staff.used, allowed: packageUsage.staff.allowed },
+      whatsappNumbers: { used: packageUsage.whatsappNumbers.used, allowed: packageUsage.whatsappNumbers.allowed },
+    };
+    return { ...this.mapClinicDetail(clinic, usage, runtime), seats, packageUsage };
+  }
+
+  async assignClinicPlan(
+    clinicId: string,
+    input: { planId: string; status: string; earlyBird: boolean },
+    admin: { adminId: string; email: string }
+  ) {
+    const clinic = await this.repo.findClinicById(clinicId);
+    if (!clinic) throw new AppError('Clinic not found', 404, 'NOT_FOUND');
+    const plan = await prisma.subscriptionPlan.findFirst({ where: { id: input.planId, isActive: true } });
+    if (!plan) throw new AppError('Choose Essential, Growth, or Scale.', 400, 'PLAN_NOT_FOUND');
+    const existing = await prisma.cgsSubscription.findFirst({
+      where: { clinicId },
+      orderBy: { createdAt: 'desc' },
+    });
+    if (input.earlyBird) await assertEarlyBirdAvailable(prisma as never, clinicId);
+    const before = existing
+      ? { planId: existing.planId, status: existing.status, earlyBird: existing.earlyBird, limitsApply: existing.limitsApply }
+      : null;
+    const after = { planId: plan.id, status: input.status, earlyBird: input.earlyBird, limitsApply: true };
+    const start = new Date();
+    const end = new Date(start);
+    end.setMonth(end.getMonth() + 1);
+    const saved = existing
+      ? await prisma.cgsSubscription.update({
+          where: { id: existing.id },
+          data: { planId: plan.id, status: input.status as never, earlyBird: input.earlyBird, limitsApply: true },
+        })
+      : await prisma.cgsSubscription.create({
+          data: {
+            clinicId,
+            planId: plan.id,
+            status: input.status as never,
+            startDate: start,
+            currentPeriodStart: start,
+            currentPeriodEnd: end,
+            earlyBird: input.earlyBird,
+            limitsApply: true,
+          },
+        });
+    await logAuditEvent({
+      clinicId,
+      actorId: admin.adminId,
+      actorEmail: admin.email,
+      actorType: 'ADMIN',
+      action: 'SUBSCRIPTION_ASSIGNED',
+      resourceType: 'SUBSCRIPTION',
+      resourceId: saved.id,
+      diffBefore: before,
+      diffAfter: after,
+    });
+    return this.getClinicById(clinicId);
+  }
+
+  async recordClinicAddon(
+    clinicId: string,
+    input: { type: string; quantity?: number; automationKey?: string },
+    admin: { adminId: string; email: string }
+  ) {
+    const subscription = await prisma.cgsSubscription.findFirst({
+      where: { clinicId },
+      orderBy: { createdAt: 'desc' },
+      include: { plan: true },
+    });
+    if (!subscription) throw new AppError('Assign a plan before recording an extra.', 400, 'SUBSCRIPTION_REQUIRED');
+    const offer = addonOffer(subscription.plan.tier, input.type, input.automationKey);
+    const quantity = input.quantity || 1;
+    const created = await prisma.clinicAddon.create({
+      data: {
+        clinicId,
+        subscriptionId: subscription.id,
+        type: input.type as never,
+        price: offer.price,
+        quantity,
+        billing: offer.billing,
+        status: 'PENDING',
+        automationKey: input.type === 'EXTRA_AUTOMATION' ? input.automationKey || null : null,
+        periodStart: input.type === 'EXTRA_AI_REPLIES' ? subscription.currentPeriodStart : null,
+        periodEnd: input.type === 'EXTRA_AI_REPLIES' ? subscription.currentPeriodEnd : null,
+      },
+    });
+    await logAuditEvent({
+      clinicId,
+      actorId: admin.adminId,
+      actorEmail: admin.email,
+      actorType: 'ADMIN',
+      action: 'ADDON_RECORDED',
+      resourceType: 'ADDON',
+      resourceId: created.id,
+      diffBefore: null,
+      diffAfter: { type: created.type, status: 'PENDING', quantity, price: offer.price, automationKey: created.automationKey },
+    });
+    return this.getClinicById(clinicId);
+  }
+
+  async confirmClinicAddon(clinicId: string, addonId: string, admin: { adminId: string; email: string }) {
+    const addon = await prisma.clinicAddon.findFirst({ where: { id: addonId, clinicId } });
+    if (!addon) throw new AppError('Add-on not found', 404, 'NOT_FOUND');
+    if (addon.status !== 'ACTIVE') {
+      await prisma.clinicAddon.update({ where: { id: addon.id }, data: { status: 'ACTIVE' } });
+      await logAuditEvent({
+        clinicId,
+        actorId: admin.adminId,
+        actorEmail: admin.email,
+        actorType: 'ADMIN',
+        action: 'ADDON_CONFIRMED',
+        resourceType: 'ADDON',
+        resourceId: addon.id,
+        diffBefore: { status: addon.status, type: addon.type },
+        diffAfter: { status: 'ACTIVE', type: addon.type, quantity: addon.quantity },
+      });
+    }
+    return this.getClinicById(clinicId);
+  }
+
+  async removeClinicAddon(clinicId: string, addonId: string, admin: { adminId: string; email: string }) {
+    const addon = await prisma.clinicAddon.findFirst({ where: { id: addonId, clinicId } });
+    if (!addon) throw new AppError('Add-on not found', 404, 'NOT_FOUND');
+    await prisma.clinicAddon.delete({ where: { id: addon.id } });
+    await logAuditEvent({
+      clinicId,
+      actorId: admin.adminId,
+      actorEmail: admin.email,
+      actorType: 'ADMIN',
+      action: 'ADDON_REMOVED',
+      resourceType: 'ADDON',
+      resourceId: addon.id,
+      diffBefore: { type: addon.type, status: addon.status, quantity: addon.quantity, automationKey: addon.automationKey },
+      diffAfter: null,
+    });
+    return this.getClinicById(clinicId);
   }
 
   async updateClinicStatus(
@@ -519,16 +676,14 @@ export class AdminService {
       closingTime?: string;
       tier?: string;
       planId?: string;
+      earlyBird?: boolean;
+      addons?: Array<{ type: string; quantity?: number; automationKey?: string }>;
       landingPage?: {
         title?: string;
         shortDescription?: string;
         primaryCta?: string;
         whatsappNumber?: string;
         enquiryFormEnabled?: boolean;
-        services?: unknown[];
-        doctors?: unknown[];
-        address?: string;
-        additionalInfo?: string;
       };
       whatsapp?: {
         businessAccountId?: string;
@@ -539,7 +694,6 @@ export class AdminService {
         webhookUrl?: string;
         verifyToken?: string;
         webhookStatus?: string;
-        messageTemplates?: Record<string, string>;
       };
       ai?: {
         receptionistName?: string;
@@ -550,25 +704,6 @@ export class AdminService {
         faqs?: string;
         isAiEnabled?: boolean;
       };
-      workflow?: {
-        qualificationEnabled?: boolean;
-        appointmentEnabled?: boolean;
-        reminderEnabled?: boolean;
-        followUpEnabled?: boolean;
-        noResponseEnabled?: boolean;
-        staffHandoffEnabled?: boolean;
-        followUpHours?: number;
-        reminderHoursBefore?: number;
-      };
-      staff?: Array<{
-        name: string;
-        email: string;
-        phone?: string;
-        password: string;
-        roleLabel: 'CLINIC_ADMIN' | 'DOCTOR' | 'RECEPTIONIST' | 'STAFF';
-        permissions?: string[];
-      }>;
-      services?: Array<{ name: string; price?: number; durationMinutes?: number }>;
     },
     admin: { adminId: string; email: string }
   ) {
@@ -600,7 +735,38 @@ export class AdminService {
         : null;
 
     if (plan) {
-      await this.repo.createClinicSubscription(clinic.id, plan.id);
+      const earlyBird = Boolean(payload.earlyBird);
+      if (earlyBird) await assertEarlyBirdAvailable(prisma as never, clinic.id);
+      const subscription = await this.repo.createClinicSubscription(clinic.id, plan.id, earlyBird);
+      for (const input of payload.addons || []) {
+        const offer = addonOffer(plan.tier, input.type, input.automationKey);
+        const quantity = Math.min(20, Math.max(1, input.quantity || 1));
+        const created = await prisma.clinicAddon.create({
+          data: {
+            clinicId: clinic.id,
+            subscriptionId: subscription.id,
+            type: input.type as never,
+            price: offer.price,
+            quantity,
+            billing: offer.billing,
+            status: 'PENDING',
+            automationKey: input.type === 'EXTRA_AUTOMATION' ? input.automationKey || null : null,
+            periodStart: input.type === 'EXTRA_AI_REPLIES' ? subscription.currentPeriodStart : null,
+            periodEnd: input.type === 'EXTRA_AI_REPLIES' ? subscription.currentPeriodEnd : null,
+          },
+        });
+        await logAuditEvent({
+          clinicId: clinic.id,
+          actorId: admin.adminId,
+          actorEmail: admin.email,
+          actorType: 'ADMIN',
+          action: 'ADDON_RECORDED',
+          resourceType: 'ADDON',
+          resourceId: created.id,
+          diffBefore: null,
+          diffAfter: { type: created.type, status: 'PENDING', quantity, price: offer.price, automationKey: created.automationKey },
+        });
+      }
     }
 
     const lp = payload.landingPage || {};
@@ -612,15 +778,6 @@ export class AdminService {
       primaryCta: lp.primaryCta || 'Book Appointment',
       whatsappNumber: lp.whatsappNumber || payload.whatsapp?.displayPhoneNumber || payload.phone,
       enquiryFormEnabled: lp.enquiryFormEnabled ?? true,
-      services: lp.services,
-      doctors: lp.doctors,
-      address: lp.address || payload.address,
-      additionalInfo: lp.additionalInfo,
-    });
-
-    await this.repo.createClinicWorkflowConfig({
-      clinicId: clinic.id,
-      ...(payload.workflow || {}),
     });
 
     const ai = payload.ai || {};
@@ -662,6 +819,7 @@ export class AdminService {
       payload.whatsapp?.phoneNumberId &&
       payload.whatsapp?.accessToken
     ) {
+      await assertCanAddWhatsappNumber(clinic.id);
       await this.repo.createWhatsappAccount({
         clinicId: clinic.id,
         phoneNumberId: payload.whatsapp.phoneNumberId,
@@ -672,76 +830,7 @@ export class AdminService {
         webhookUrl: payload.whatsapp.webhookUrl,
         verifyToken: payload.whatsapp.verifyToken,
         webhookStatus: payload.whatsapp.webhookStatus || 'PENDING',
-        messageTemplates: payload.whatsapp.messageTemplates,
       });
-    }
-
-    if (payload.services?.length) {
-      await this.repo.createClinicServices(clinic.id, payload.services);
-    }
-
-    const staffList = payload.staff?.length
-      ? payload.staff
-      : payload.doctorName
-        ? [
-            {
-              name: payload.doctorName,
-              email: payload.email || `${slug}@clinicgrowth.com`,
-              phone: payload.phone,
-              roleLabel: 'DOCTOR' as const,
-            },
-          ]
-        : [];
-
-    if (staffList.length > 0) {
-      await assertClinicSeatAvailable(clinic.id, staffList.length);
-    }
-
-    for (const member of staffList) {
-      const { firstName, lastName } = splitName(member.name);
-      const isDoctor = member.roleLabel === 'DOCTOR' || member.roleLabel === 'CLINIC_ADMIN';
-      if (!('password' in member) || !member.password || member.password.length < 6) {
-        throw new AppError(
-          `Password is required for clinic user ${member.email} (min 6 characters)`,
-          400,
-          'VALIDATION_ERROR'
-        );
-      }
-      const passwordHash = await bcrypt.hash(member.password, 10);
-      const roleTitles: Record<string, string> = {
-        CLINIC_ADMIN: 'Clinic Admin',
-        DOCTOR: 'Dr.',
-        RECEPTIONIST: 'Receptionist',
-        STAFF: 'Staff',
-      };
-      try {
-        await this.repo.createClinicStaffUser({
-          clinicId: clinic.id,
-          email: member.email,
-          passwordHash,
-          firstName,
-          lastName,
-          title: roleTitles[member.roleLabel] || 'Staff',
-          phone: member.phone,
-          role: isDoctor ? 'DOCTOR' : 'EMPLOYEE',
-          specialization: isDoctor ? 'General Dentistry' : undefined,
-        });
-      } catch (err: any) {
-        if (err instanceof AppError) throw err;
-        const msg = String(err?.message || err);
-        if (msg.includes('Unique constraint') || msg.includes('unique') || err?.code === 'P2002') {
-          throw new AppError(
-            `Clinic user email already exists for this clinic: ${member.email}`,
-            409,
-            'DUPLICATE_EMAIL'
-          );
-        }
-        throw new AppError(
-          `Failed to create clinic user ${member.email}: ${msg}`,
-          500,
-          'USER_CREATE_FAILED'
-        );
-      }
     }
 
     await logAuditEvent({
@@ -1029,7 +1118,7 @@ export class AdminService {
       qualification?: string;
       experienceYears?: number;
       consultationFee?: number;
-      password?: string;
+      password: string;
     },
     admin: { adminId: string; email: string }
   ) {
@@ -1038,11 +1127,18 @@ export class AdminService {
       throw new AppError('Clinic not found', 404, 'NOT_FOUND');
     }
 
-    await assertClinicSeatAvailable(clinicId);
+    const seat = payload.role === 'DOCTOR'
+      ? await assertCanAddDoctor(clinicId)
+      : await assertCanAddStaff(clinicId);
+    if (!seat.enforced) {
+      await assertClinicSeatAvailable(clinicId);
+    }
 
     const { firstName, lastName } = splitName(payload.name);
-    const defaultPassword = payload.role === 'DOCTOR' ? 'Doctor123!' : 'Employee123!';
-    const passwordHash = await bcrypt.hash(payload.password || defaultPassword, 10);
+    if (!payload.password || payload.password.length < 6) {
+      throw new AppError('Password is required (min 6 characters).', 400, 'VALIDATION_ERROR');
+    }
+    const passwordHash = await bcrypt.hash(payload.password, 10);
 
     const user = await this.repo.createClinicStaffUser({
       clinicId,
@@ -1257,8 +1353,8 @@ export class AdminService {
         avgDurationMs: Math.round(g._avg.durationMs || 0),
         whatsappConsumed: wa?._sum.quantity || 0,
         whatsappCost: Number(wa?._sum.totalCost || 0),
-        whatsappIncluded: plan?.whatsappIncluded || 1000,
-        aiTokensIncluded: plan?.aiTokensIncluded || 1000000,
+        whatsappIncluded: plan?.whatsappIncluded ?? null,
+        aiTokensIncluded: plan?.aiTokensIncluded ?? null,
       };
     });
   }
@@ -1334,7 +1430,7 @@ export class AdminService {
       currentPeriodStart: s.currentPeriodStart,
       currentPeriodEnd: s.currentPeriodEnd,
       autoRenew: s.autoRenew,
-      amount: s.plan ? Number(s.plan.priceMonthly) : 0,
+      amount: packageMonthlyAmount(s.plan, Boolean(s.earlyBird)),
       currency: s.plan?.currency || 'INR',
       paymentMethodLast4: '0000',
       paymentMethodBrand: 'UPI',
@@ -1349,25 +1445,135 @@ export class AdminService {
       clinicId: inv.clinicId,
       clinicName: inv.subscription?.clinic?.name || 'Clinic',
       planName: inv.subscription?.plan?.name || 'Plan',
+      description: inv.notes || '',
       amount: Number(inv.subtotal || 0),
-      taxAmount: 0,
+      taxAmount: Number(inv.adjustments || 0),
       totalAmount: Number(inv.total || 0),
       currency: 'INR',
-      status: inv.status === 'PAID' ? 'PAID' : inv.status === 'VOID' ? 'REFUNDED' : 'PENDING',
+      status: inv.status === 'PAID' ? 'PAID' : inv.status === 'VOID' ? 'REFUNDED' : inv.status === 'OVERDUE' ? 'OVERDUE' : inv.status === 'ISSUED' ? 'ISSUED' : 'PENDING',
       billingPeriodStart: inv.periodStart,
       billingPeriodEnd: inv.periodEnd,
       dueDate: inv.dueAt || inv.periodEnd,
-      paidAt: inv.issuedAt,
+      paidAt: inv.status === 'PAID' ? inv.issuedAt : undefined,
     }));
   }
 
+  async subscriptionInvoicePdf(id: string) {
+    const invoice = await this.repo.findSubscriptionInvoice(id);
+    if (!invoice) {
+      throw new AppError('Invoice not found.', 404, 'NOT_FOUND');
+    }
+    const address = [invoice.clinic.address, invoice.clinic.city].filter(Boolean).join(', ');
+    const priced = gstOn(Number(invoice.subtotal || 0));
+    const taxAmount = Number(invoice.adjustments || 0) > 0 ? Number(invoice.adjustments) : priced.taxAmount;
+    const total = Number(invoice.adjustments || 0) > 0 ? Number(invoice.total || 0) : priced.total;
+    const buffer = await buildSubscriptionInvoicePdf({
+      invoiceNumber: invoice.invoiceNumber,
+      status: invoice.status,
+      description: invoice.notes || `${invoice.subscription?.plan?.name || 'Plan'} monthly subscription`,
+      subtotal: Number(invoice.subtotal || 0),
+      taxAmount,
+      total,
+      periodStart: invoice.periodStart,
+      periodEnd: invoice.periodEnd,
+      dueAt: invoice.dueAt,
+      clinicName: invoice.clinic.name,
+      clinicEmail: invoice.clinic.email,
+      clinicPhone: invoice.clinic.phone,
+      clinicAddress: address,
+      planName: invoice.subscription?.plan?.name || 'Plan',
+    });
+    return { buffer, filename: subscriptionInvoiceFilename(invoice.invoiceNumber) };
+  }
+
+  async createOneTimeInvoice(body: { clinicId?: string; description?: string; amount?: number; dueDate?: string }) {
+    const clinicId = String(body.clinicId || '').trim();
+    const description = String(body.description || '').trim();
+    const amount = Number(body.amount);
+    if (!clinicId) throw new AppError('Choose a clinic.', 400, 'VALIDATION_ERROR');
+    if (description.length < 3) throw new AppError('Describe the one-time payment.', 400, 'VALIDATION_ERROR');
+    if (!Number.isFinite(amount) || amount <= 0) throw new AppError('Enter an amount greater than zero.', 400, 'VALIDATION_ERROR');
+
+    const dueAt = body.dueDate ? new Date(body.dueDate) : new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+    if (Number.isNaN(dueAt.getTime())) throw new AppError('The due date is not valid.', 400, 'VALIDATION_ERROR');
+
+    const priced = gstOn(amount);
+    const issuedAt = new Date();
+
+    const invoice = await prisma.$transaction(async (tx) => {
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`subbill-clinic:${clinicId}`}))`;
+      const subscription = await tx.cgsSubscription.findFirst({
+        where: { clinicId, status: { in: ['ACTIVE', 'PAST_DUE'] } },
+        orderBy: { createdAt: 'desc' },
+      });
+      if (!subscription) {
+        throw new AppError('This clinic has no active subscription.', 400, 'SUBSCRIPTION_REQUIRED');
+      }
+      const count = await tx.subscriptionInvoice.count({ where: { clinicId } });
+      const invoiceNumber = `CGS-${issuedAt.getUTCFullYear()}-${String(count + 1).padStart(4, '0')}`;
+      return tx.subscriptionInvoice.create({
+        data: {
+          clinicId,
+          subscriptionId: subscription.id,
+          invoiceNumber,
+          subtotal: priced.subtotal,
+          usageCharges: 0,
+          adjustments: priced.taxAmount,
+          total: priced.total,
+          notes: description,
+          status: 'ISSUED',
+          periodStart: issuedAt,
+          periodEnd: dueAt,
+          issuedAt,
+          dueAt,
+        },
+        include: {
+          subscription: { include: { plan: { select: { name: true } }, clinic: { select: { name: true } } } },
+        },
+      });
+    });
+
+    return {
+      id: invoice.id,
+      invoiceNumber: invoice.invoiceNumber,
+      clinicId: invoice.clinicId,
+      clinicName: invoice.subscription?.clinic?.name || 'Clinic',
+      planName: invoice.subscription?.plan?.name || 'Plan',
+      description,
+      amount: priced.subtotal,
+      taxAmount: priced.taxAmount,
+      totalAmount: priced.total,
+      currency: 'INR',
+      status: 'ISSUED',
+      billingPeriodStart: invoice.periodStart,
+      billingPeriodEnd: invoice.periodEnd,
+      dueDate: invoice.dueAt,
+    };
+  }
+
   async listPlans() {
+    // priceMonthly stays the amount already billed. Brochure prices are the regular* fields.
     const plans = await this.repo.listPlans();
     return plans.map((p: any) => ({
       id: p.id,
       name: p.name,
       tier: p.tier,
       priceMonthly: Number(p.priceMonthly),
+      regularMonthlyPrice: Number(p.regularMonthlyPrice || 0),
+      earlyBirdMonthlyPrice: Number(p.earlyBirdMonthlyPrice || 0),
+      regularSetupFee: Number(p.regularSetupFee || 0),
+      earlyBirdSetupFee: Number(p.earlyBirdSetupFee || 0),
+      doctorsIncluded: p.doctorsIncluded,
+      staffIncluded: p.staffIncluded,
+      whatsappNumbersIncluded: p.whatsappNumbersIncluded,
+      aiRepliesMonthly: p.aiRepliesMonthly,
+      modelLevel: p.modelLevel,
+      conversationMemory: p.conversationMemory,
+      reportingLevel: p.reportingLevel,
+      customAiIncluded: p.customAiIncluded,
+      outboundIncluded: p.outboundIncluded,
+      prioritySupportIncluded: p.prioritySupportIncluded,
+      automationKeys: p.automationKeys || [],
       billingCycle: p.billingCycle === 'ANNUAL' ? 'ANNUAL' : 'MONTHLY',
       features: p.features || [],
       whatsappConversationsIncluded: p.whatsappIncluded,
@@ -1484,6 +1690,9 @@ export class AdminService {
     if (!job) {
       throw new AppError('Job not found', 404, 'NOT_FOUND');
     }
+    if (job.status !== 'FAILED') {
+      throw new AppError('Only a failed job can be retried.', 409, 'JOB_NOT_RETRYABLE');
+    }
     const updated = await this.repo.retryJob(id);
     await logAuditEvent({
       clinicId: job.clinicId || undefined,
@@ -1558,7 +1767,8 @@ export class AdminService {
       openingTime: c.openingTime || '',
       closingTime: c.closingTime || '',
       tier: plan?.tier || 'STARTER',
-      mrr: plan ? Number(plan.priceMonthly) : 0,
+      packageAssigned: Boolean(plan),
+      mrr: packageMonthlyAmount(plan, Boolean(c.cgsSubscriptions?.[0]?.earlyBird)),
       createdAt: c.createdAt,
       doctorsCount,
       staffCount: Math.max(0, usersCount - doctorsCount),
@@ -1570,7 +1780,53 @@ export class AdminService {
     };
   }
 
-  private mapClinicDetail(c: any, usage: { ai: any; wa: any }) {
+  private ratesForModel(model: string, provider: string) {
+    if (model.includes(':free')) return { inputUsdPerMillion: 0, outputUsdPerMillion: 0 };
+    if (provider === 'groq') return { inputUsdPerMillion: 0.59, outputUsdPerMillion: 0.79 };
+    return { inputUsdPerMillion: 0.08, outputUsdPerMillion: 0.35 };
+  }
+
+  private async fetchAiRuntime() {
+    try {
+      const data = await aiClient.request<any>('/internal/diagnostics');
+      const provider = data?.provider || 'unknown';
+      const models = [data?.default_model, data?.fallback_model, data?.fallback_model_2].filter(
+        (name: unknown): name is string => typeof name === 'string' && name.length > 0
+      );
+      const reported = Array.isArray(data?.model_rates) ? data.model_rates : [];
+      const modelRates = models.map((name) => {
+        const row = reported.find((item: any) => item?.name === name);
+        if (row && row.input_usd_per_million != null && row.output_usd_per_million != null) {
+          return {
+            name,
+            inputUsdPerMillion: Number(row.input_usd_per_million),
+            outputUsdPerMillion: Number(row.output_usd_per_million),
+          };
+        }
+        return { name, ...this.ratesForModel(name, provider) };
+      });
+      const defaultRates = modelRates[0] || this.ratesForModel(String(data?.default_model || ''), provider);
+      return {
+        provider,
+        model: data?.default_model || '',
+        fallbackModel: data?.fallback_model || '',
+        fallbackModel2: data?.fallback_model_2 || '',
+        llmConfigured: Boolean(data?.llm_configured),
+        inputUsdPerMillion: data?.input_usd_per_million != null
+          ? Number(data.input_usd_per_million)
+          : defaultRates.inputUsdPerMillion,
+        outputUsdPerMillion: data?.output_usd_per_million != null
+          ? Number(data.output_usd_per_million)
+          : defaultRates.outputUsdPerMillion,
+        models,
+        modelRates,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  private mapClinicDetail(c: any, usage: { ai: any; wa: any }, runtime?: { provider: string; model: string } | null) {
     const base = this.mapClinicListItem(c);
     const plan = c.cgsSubscriptions?.[0]?.plan;
     const subscription = c.cgsSubscriptions?.[0];
@@ -1611,10 +1867,14 @@ export class AdminService {
             currentPeriodStart: subscription.currentPeriodStart,
             currentPeriodEnd: subscription.currentPeriodEnd,
             autoRenew: subscription.autoRenew,
-            amount: plan ? Number(plan.priceMonthly) : 0,
+            earlyBird: subscription.earlyBird,
+            limitsApply: subscription.limitsApply,
+            packageMonthly: packageMonthlyAmount(plan, Boolean(subscription.earlyBird)),
+            assigned: true,
+            amount: packageMonthlyAmount(plan, Boolean(subscription.earlyBird)),
             currency: plan?.currency || 'INR',
-            paymentMethodLast4: '0000',
-            paymentMethodBrand: 'UPI',
+            paymentMethodLast4: '',
+            paymentMethodBrand: '',
           }
         : {
             id: `sub-${c.id}`,
@@ -1631,7 +1891,38 @@ export class AdminService {
             currency: 'INR',
             paymentMethodLast4: '',
             paymentMethodBrand: '',
+            earlyBird: false,
+            limitsApply: false,
+            packageMonthly: 0,
+            assigned: false,
           },
+      addons: (c.addons || []).map((addon: any) => ({
+        id: addon.id,
+        type: addon.type,
+        price: Number(addon.price),
+        quantity: addon.quantity,
+        billing: addon.billing,
+        status: addon.status,
+        automationKey: addon.automationKey,
+        periodStart: addon.periodStart,
+        periodEnd: addon.periodEnd,
+      })),
+      subscriptionInvoices: (c.cgsSubscriptions || [])
+        .flatMap((row: any) => row.invoices || [])
+        .sort((a: any, b: any) => new Date(b.periodStart).getTime() - new Date(a.periodStart).getTime())
+        .slice(0, 12)
+        .map((invoice: any) => ({
+          id: invoice.id,
+          invoiceNumber: invoice.invoiceNumber,
+          subtotal: Number(invoice.subtotal || 0),
+          taxAmount: Number(invoice.adjustments || 0),
+          total: Number(invoice.total || 0),
+          description: invoice.notes || '',
+          status: invoice.status,
+          periodStart: invoice.periodStart,
+          periodEnd: invoice.periodEnd,
+          dueAt: invoice.dueAt,
+        })),
       whatsappConfig: {
         phoneNumber: wa?.displayPhoneNumber || c.phone || '',
         wabaId: wa?.businessAccountId || wa?.phoneNumberId || '',
@@ -1648,10 +1939,10 @@ export class AdminService {
       },
       aiConfig: {
         enabled: c.aiConfig?.isAiEnabled ?? true,
-        provider: c.aiConfig?.primaryProvider || 'google',
-        model: c.aiConfig?.primaryModel || 'google/gemma-4-31b-it',
+        provider: runtime?.provider || '',
+        model: runtime?.model || '',
         systemPromptVersion: c.aiConfig?.systemPrompt ? 'custom' : 'default',
-        monthlyTokenQuota: 1000000,
+        monthlyTokenQuota: plan?.aiTokensIncluded ?? null,
         tokensConsumedThisMonth: usage.ai._sum.totalTokens || 0,
         customKnowledgeDocsCount: 0,
         tone: c.aiConfig?.tone || 'professional',
@@ -1851,6 +2142,9 @@ export class AdminService {
       waStatus = 'DISCONNECTED';
     }
 
+    const runtime = await this.fetchAiRuntime();
+    if (!runtime) aiStatus = 'DISCONNECTED';
+
     let targetClinicData: any = null;
     if (clinicQuery) {
       const clinic = await prisma.clinic.findFirst({
@@ -1869,17 +2163,29 @@ export class AdminService {
       });
 
       if (clinic) {
+        const monthStart = new Date();
+        monthStart.setDate(1);
+        monthStart.setHours(0, 0, 0, 0);
+        const [tokenUse, failedJobs] = await Promise.all([
+          prisma.aiUsage.aggregate({
+            where: { clinicId: clinic.id, createdAt: { gte: monthStart } },
+            _sum: { totalTokens: true },
+          }),
+          prisma.job.count({ where: { clinicId: clinic.id, status: 'FAILED' } }),
+        ]);
+        const account = clinic.whatsappAccounts[0];
         targetClinicData = {
           clinicId: clinic.id,
           clinicName: clinic.name,
           slug: clinic.slug,
-          wabaHealth: clinic.whatsappAccounts[0]?.isActive ? 'HEALTHY' : 'DISCONNECTED',
-          wabaLatency: `${waLatencyMs || 142}ms`,
-          aiQuotaState: clinic.aiConfig?.isAiEnabled ? 'NORMAL' : 'PAUSED',
-          aiTokensRemaining: '820,000 / 1,000,000',
-          webhookStatus: clinic.whatsappAccounts[0]?.isActive ? 'ACTIVE (HTTP 200)' : 'INACTIVE',
-          lastPing: new Date().toLocaleTimeString(),
-          unresolvedErrors: 0,
+          wabaHealth: account?.isActive ? 'HEALTHY' : 'DISCONNECTED',
+          wabaLatency: `${waLatencyMs}ms`,
+          aiQuotaState: clinic.aiConfig?.isAiEnabled ? 'ENABLED' : 'PAUSED',
+          aiTokensUsedThisMonth: tokenUse._sum.totalTokens || 0,
+          aiModel: runtime?.model || '',
+          webhookStatus: account?.webhookStatus || (account?.isActive ? 'ACTIVE' : 'INACTIVE'),
+          lastPing: new Date().toISOString(),
+          unresolvedErrors: failedJobs,
           stats: clinic._count,
         };
       }
@@ -1888,7 +2194,20 @@ export class AdminService {
     return {
       system: {
         database: { status: dbStatus, latency: `${dbLatencyMs}ms` },
-        aiService: { status: aiStatus, latency: `${aiLatencyMs}ms`, model: 'google/gemma-4-31b-it', url: env.AI_SERVICE_URL },
+        aiService: {
+          status: runtime ? aiStatus : 'DISCONNECTED',
+          latency: `${aiLatencyMs}ms`,
+          provider: runtime?.provider || '',
+          model: runtime?.model || '',
+          fallbackModel: runtime?.fallbackModel || '',
+          fallbackModel2: runtime?.fallbackModel2 || '',
+          models: runtime?.models || [],
+          modelRates: runtime?.modelRates || [],
+          llmConfigured: runtime?.llmConfigured || false,
+          inputUsdPerMillion: runtime?.inputUsdPerMillion ?? 0,
+          outputUsdPerMillion: runtime?.outputUsdPerMillion ?? 0,
+          url: env.AI_SERVICE_URL,
+        },
         whatsappService: { status: waStatus, latency: `${waLatencyMs}ms`, url: env.WHATSAPP_SERVICE_URL },
         uptimeSeconds: Math.floor(process.uptime()),
         timestamp: new Date().toISOString(),
@@ -1897,45 +2216,31 @@ export class AdminService {
     };
   }
 
-  async generateAiAdmin(prompt: string, systemInstruction?: string, temperature: number = 0.3) {
-    try {
-      const response = await fetch(`${env.AI_SERVICE_URL}/api/v1/generate`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-Service-Key': env.INTERNAL_SERVICE_SECRET,
-        },
-        body: JSON.stringify({
-          entity_id: 'admin-platform',
-          entity_type: 'CLINIC',
-          participant_id: 'admin-tester',
-          message: prompt,
-          model_override: 'google/gemma-4-31b-it',
-          temperature: temperature || 0.3,
-          metadata: {
-            system_instruction: systemInstruction,
-            source: 'admin_control_plane',
-          },
-        }),
-      });
-
-      if (!response.ok) {
-        const errText = await response.text().catch(() => '');
-        throw new Error(`AI Service returned ${response.status}: ${errText}`);
-      }
-
-      const result = await response.json();
-      return result;
-    } catch (err: any) {
-      console.error('[Admin AI] Direct generation failed:', err.message);
-      return {
-        request_id: `req-admin-${Date.now()}`,
-        entity_id: 'admin-platform',
-        response: `[Gemma 4 31B Response]: Generated response for "${prompt}".`,
-        tool_calls: [],
-        usage: { prompt_tokens: 45, completion_tokens: 120, total_tokens: 165, estimated_cost: 0.00002 },
-      };
+  async generateAiAdmin(body: {
+    prompt?: string;
+    message?: string;
+    systemInstruction?: string;
+    temperature?: number;
+    entity_id?: string;
+    entity_type?: string;
+    participant_id?: string;
+    channel?: string;
+  }) {
+    const message = (body.message || body.prompt || '').trim();
+    if (!message) {
+      throw new AppError('A message is required.', 400, 'VALIDATION_ERROR');
     }
+    return aiClient.generate({
+      entity_id: body.entity_id || 'admin-platform',
+      entity_type: body.entity_type || 'CLINIC',
+      participant_id: body.participant_id || 'admin-tester',
+      message,
+      channel: body.channel || 'WHATSAPP',
+      temperature: body.temperature ?? 0.3,
+      metadata: body.systemInstruction
+        ? { system_instruction: body.systemInstruction, source: 'admin_control_plane' }
+        : { source: 'admin_control_plane' },
+    });
   }
 }
 

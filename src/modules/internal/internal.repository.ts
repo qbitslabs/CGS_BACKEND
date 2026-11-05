@@ -478,8 +478,10 @@ export class InternalRepository {
     patientName: string;
     doctorId?: string;
     service: string;
+    serviceId?: string | null;
     startsAt: Date;
     endsAt: Date;
+    durationMinutes?: number;
     notes?: string;
     date: string;
     time: string;
@@ -615,12 +617,36 @@ export class InternalRepository {
       }
 
       if (params.doctorId) {
-        await assertDoctorSlotAvailable(tx, {
+        const own = await assertDoctorSlotAvailable(tx, {
           clinicId: params.clinicId,
           doctorId: params.doctorId,
           startsAt: params.startsAt,
           endsAt: params.endsAt,
+          samePatientId: patient.id,
         });
+        if (own) {
+          let doctorName: string | undefined;
+          const bookedDoctor = await tx.doctor.findFirst({
+            where: { id: params.doctorId, clinicId: params.clinicId },
+            include: { user: { select: { firstName: true, lastName: true } } },
+          });
+          if (bookedDoctor?.user) {
+            doctorName = `${bookedDoctor.user.firstName || ''} ${bookedDoctor.user.lastName || ''}`.trim();
+          }
+          return {
+            appointmentId: own.id,
+            patientId: patient.id,
+            patientName: patient.name,
+            patientAge: patient.age,
+            patientGender: patient.gender,
+            service: own.service,
+            date: params.date,
+            time: params.time,
+            status: own.status,
+            doctorName: doctorName || undefined,
+            idempotent: true,
+          };
+        }
       }
 
       const appointment = await tx.appointment.create({
@@ -632,13 +658,19 @@ export class InternalRepository {
           status: 'CONFIRMED',
           startsAt: params.startsAt,
           endsAt: params.endsAt,
-          durationMinutes: 30,
+          durationMinutes: params.durationMinutes || 30,
           notes: params.notes ? `[Booked by AI Assistant] ${params.notes}` : '[Booked by AI Assistant]',
         },
       }).catch((err: unknown) => {
         if (isSlotConflictError(err)) throw new Error('SLOT_ALREADY_BOOKED');
         throw err;
       });
+
+      if (params.serviceId) {
+        await tx.appointmentService.create({
+          data: { appointmentId: appointment.id, serviceId: params.serviceId },
+        });
+      }
 
       if (matchingLead) {
         await tx.lead.update({

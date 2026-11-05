@@ -15,6 +15,8 @@ import {
   updateDoctorAiConfigSchema,
   publicLandingEnquirySchema,
   setPrimaryDoctorSchema,
+  assignClinicPlanSchema,
+  recordClinicAddonSchema,
 } from './admin.schema.js';
 
 export class AdminController {
@@ -234,6 +236,26 @@ export class AdminController {
     }
   };
 
+  downloadInvoicePdf = async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
+    try {
+      const pdf = await this.service.subscriptionInvoicePdf(req.params.id);
+      res.setHeader('Content-Type', 'application/pdf');
+      res.setHeader('Content-Disposition', `attachment; filename="${pdf.filename}"`);
+      res.send(pdf.buffer);
+    } catch (error) {
+      next(error);
+    }
+  };
+
+  createOneTimeInvoice = async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
+    try {
+      const data = await this.service.createOneTimeInvoice(req.body || {});
+      res.status(201).json({ success: true, data });
+    } catch (error) {
+      next(error);
+    }
+  };
+
   getPlans = async (_req: AuthenticatedRequest, res: Response, next: NextFunction) => {
     try {
       const data = await this.service.listPlans();
@@ -310,6 +332,60 @@ export class AdminController {
       const { id } = req.params;
       const body = setPrimaryDoctorSchema.parse(req.body);
       const data = await this.service.setPrimaryDoctor(id, body, {
+        adminId: req.admin!.adminId,
+        email: req.admin!.email,
+      });
+      res.json({ success: true, data });
+    } catch (error) {
+      next(error);
+    }
+  };
+
+  assignClinicPlan = async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
+    try {
+      const { id } = req.params;
+      const body = assignClinicPlanSchema.parse(req.body);
+      const data = await this.service.assignClinicPlan(id, body, {
+        adminId: req.admin!.adminId,
+        email: req.admin!.email,
+      });
+      res.json({ success: true, data });
+    } catch (error) {
+      next(error);
+    }
+  };
+
+  recordClinicAddon = async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
+    try {
+      const { id } = req.params;
+      const body = recordClinicAddonSchema.parse(req.body);
+      const data = await this.service.recordClinicAddon(id, body, {
+        adminId: req.admin!.adminId,
+        email: req.admin!.email,
+      });
+      res.json({ success: true, data });
+    } catch (error) {
+      next(error);
+    }
+  };
+
+  confirmClinicAddon = async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
+    try {
+      const { id, addonId } = req.params;
+      const data = await this.service.confirmClinicAddon(id, addonId, {
+        adminId: req.admin!.adminId,
+        email: req.admin!.email,
+      });
+      res.json({ success: true, data });
+    } catch (error) {
+      next(error);
+    }
+  };
+
+  removeClinicAddon = async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
+    try {
+      const { id, addonId } = req.params;
+      const data = await this.service.removeClinicAddon(id, addonId, {
         adminId: req.admin!.adminId,
         email: req.admin!.email,
       });
@@ -449,8 +525,7 @@ export class AdminController {
 
   generateAi = async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
     try {
-      const { prompt, systemInstruction, temperature } = req.body;
-      const data = await this.service.generateAiAdmin(prompt, systemInstruction, temperature);
+      const data = await this.service.generateAiAdmin(req.body || {});
       res.json({ success: true, data });
     } catch (error) {
       next(error);

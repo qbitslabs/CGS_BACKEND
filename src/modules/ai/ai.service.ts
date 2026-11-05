@@ -30,21 +30,7 @@ export class AiService {
   }
 
   async getEntities() {
-    try {
-      return await this.client.getEntities();
-    } catch {
-      // Fallback
-      return [
-        {
-          id: 'ent_rest_01',
-          type: 'RESTAURANT',
-          name: 'Bake & Brew Bistro',
-          system_prompt: 'You are a warm host assisting customers with table reservations and menu queries.',
-          configuration: { cuisine: 'Italian / Cafe', hours: '11:00 AM - 11:00 PM' },
-          status: 'ACTIVE',
-        },
-      ];
-    }
+    return this.client.getEntities();
   }
 
   async createEntity(dto: AIEntityCreateDTO) {

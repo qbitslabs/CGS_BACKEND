@@ -14,8 +14,16 @@ import {
   scanDueReminders,
   scanMissedAndCompleted,
 } from '../modules/whatsapp/outbound.schedule.js';
-import { WHATSAPP_TEMPLATE_SEND_JOB } from '../modules/whatsapp/whatsappTemplates.js';
+import { shouldSkipAcceptedSend, WHATSAPP_TEMPLATE_SEND_JOB } from '../modules/whatsapp/whatsappTemplates.js';
 import { AI_GENERATE_REPLY_JOB, ClaimedJobRow, claimPendingJobs, recoverStaleProcessingJobs } from './jobClaim.js';
+import {
+  BILL_SCAN_MS,
+  SUBSCRIPTION_BILL_CREATE_JOB,
+  SUBSCRIPTION_BILL_SCAN_JOB,
+  createSubscriptionBill,
+  ensureSubscriptionBillJob,
+  scanSubscriptionBills,
+} from '../modules/admin/subscriptionBill.job.js';
 
 let isRunning = false;
 let shouldStop = false;
@@ -27,10 +35,11 @@ const workerId = `worker-${process.pid}-${Math.random().toString(36).substring(7
 let lastSchedulerEnsure = 0;
 
 function isOutboundSchedulerJob(type: string) {
-  return type === OUTBOUND_REMINDER_SCAN_JOB || type === OUTBOUND_OUTCOME_SCAN_JOB;
+  return type === OUTBOUND_REMINDER_SCAN_JOB || type === OUTBOUND_OUTCOME_SCAN_JOB || type === SUBSCRIPTION_BILL_SCAN_JOB;
 }
 
 function schedulerDelayMs(type: string) {
+  if (type === SUBSCRIPTION_BILL_SCAN_JOB) return BILL_SCAN_MS;
   return type === OUTBOUND_REMINDER_SCAN_JOB ? REMINDER_SCAN_MS : OUTCOME_SCAN_MS;
 }
 
@@ -86,6 +95,7 @@ export const startJobWorker = async () => {
       lastSchedulerEnsure = Date.now();
       try {
         await ensureOutboundSchedulerJobs();
+        await ensureSubscriptionBillJob();
       } catch (err: any) {
         console.error('[Worker] Could not ensure outbound scheduler jobs:', err.message);
       }
@@ -111,8 +121,9 @@ export const startJobWorker = async () => {
     }
     aiPollActive = true;
     try {
-      const twoMinutesAgo = new Date(Date.now() - 2 * 60 * 1000);
-      await recoverStaleProcessingJobs(twoMinutesAgo, { jobType: AI_GENERATE_REPLY_JOB });
+      // AI calls may run 90s, then WhatsApp send. Recover only after that window.
+      const fourMinutesAgo = new Date(Date.now() - 4 * 60 * 1000);
+      await recoverStaleProcessingJobs(fourMinutesAgo, { jobType: AI_GENERATE_REPLY_JOB });
 
       const slots = Math.max(aiConcurrency - aiInFlight, 0);
       if (slots > 0) {
@@ -249,12 +260,13 @@ async function executeJobHandler(job: {
 
     case WHATSAPP_TEMPLATE_SEND_JOB: {
       try {
-        await executeTemplateSendJob({
+        const outcome = await executeTemplateSendJob({
           clinicId: job.clinicId,
           attempts: job.attempts,
           maxAttempts: job.maxAttempts,
           payload: job.payload,
         });
+        if (outcome === 'skipped') break;
         const messageId = job.payload?.messageId;
         if (job.clinicId && messageId) {
           const saved = await prisma.message.findFirst({
@@ -305,6 +317,20 @@ async function executeJobHandler(job: {
         throw new Error('WhatsApp account is not configured for this clinic');
       }
 
+      if (payload.messageId) {
+        const saved = await prisma.message.findFirst({
+          where: {
+            id: payload.messageId,
+            ...(job.clinicId ? { clinicId: job.clinicId } : {}),
+          },
+          select: { providerMessageId: true },
+        });
+        if (shouldSkipAcceptedSend(saved?.providerMessageId)) {
+          console.log(`[Worker] WHATSAPP_SEND ${job.id} already accepted by WhatsApp`);
+          break;
+        }
+      }
+
       console.log(`[Worker] Dispatching WHATSAPP_SEND via WhatsApp Gateway at ${env.WHATSAPP_SERVICE_URL} for recipient ${payload.recipientPhone}`);
 
       try {
@@ -314,6 +340,7 @@ async function executeJobHandler(job: {
             'Content-Type': 'application/json',
             'X-Service-Key': env.INTERNAL_SERVICE_SECRET,
           },
+          signal: AbortSignal.timeout(30_000),
           body: JSON.stringify({
             phoneNumberId,
             recipientPhone: payload.recipientPhone,
@@ -337,21 +364,37 @@ async function executeJobHandler(job: {
           console.warn(`[Worker] WhatsApp gateway returned ${response.status}:`, resData);
           if (payload.messageId) {
             await prisma.message.updateMany({
-              where: { id: payload.messageId },
+              where: {
+                id: payload.messageId,
+                ...(job.clinicId ? { clinicId: job.clinicId } : {}),
+              },
               data: { status: 'FAILED' },
             });
           }
           throw new Error(resData?.error || `WhatsApp Gateway Error: ${response.statusText}`);
         }
 
-        if (payload.messageId) {
+        const providerId = resData?.data?.messages?.[0]?.id;
+        if (payload.messageId && providerId) {
           await prisma.message.updateMany({
-            where: { id: payload.messageId },
+            where: {
+              id: payload.messageId,
+              ...(job.clinicId ? { clinicId: job.clinicId } : {}),
+            },
             data: {
-              status: 'DELIVERED',
-              providerMessageId: resData?.data?.messages?.[0]?.id || undefined,
+              status: 'SENT',
+              providerMessageId: providerId,
             },
           });
+        } else if (payload.messageId) {
+          await prisma.message.updateMany({
+            where: {
+              id: payload.messageId,
+              ...(job.clinicId ? { clinicId: job.clinicId } : {}),
+            },
+            data: { status: 'FAILED' },
+          });
+          throw new Error('WhatsApp accepted the send without a message id');
         }
         console.log(`[Worker] Successfully dispatched WhatsApp message for job ${job.id}`);
       } catch (err: any) {
@@ -399,6 +442,46 @@ async function executeJobHandler(job: {
 
     case 'APPOINTMENT_REMINDER_DISPATCH': {
       await scanDueReminders(new Date());
+      break;
+    }
+
+    case SUBSCRIPTION_BILL_SCAN_JOB: {
+      const summary = await scanSubscriptionBills(new Date());
+      await prisma.job.update({
+        where: { id: job.id },
+        data: {
+          payload: {
+            note: `Package bill check finished. Queued ${summary.queued} bill${summary.queued === 1 ? '' : 's'} for ${summary.clinics} clinics. ${summary.alreadyBilled} periods already had a bill.`,
+            clinics: summary.clinics,
+            queued: summary.queued,
+            alreadyBilled: summary.alreadyBilled,
+            previousRanAt: new Date().toISOString(),
+          },
+        },
+      });
+      break;
+    }
+
+    case SUBSCRIPTION_BILL_CREATE_JOB: {
+      const billPayload =
+        job.payload && typeof job.payload === 'object' && !Array.isArray(job.payload) ? job.payload : {};
+      const result = await createSubscriptionBill(billPayload);
+      const note = result.created
+        ? `Issued ${result.invoiceNumber} for ₹${result.total}`
+        : result.invoiceNumber
+          ? `Bill ${result.invoiceNumber} already exists for this period`
+          : 'Skipped. This subscription is not active.';
+      await prisma.job.update({
+        where: { id: job.id },
+        data: {
+          payload: {
+            ...billPayload,
+            note,
+            invoiceNumber: result.invoiceNumber,
+            total: result.total,
+          },
+        },
+      });
       break;
     }
 

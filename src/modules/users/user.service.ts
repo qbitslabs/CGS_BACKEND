@@ -8,6 +8,7 @@ import { AppError } from '../../middleware/errorHandler.js';
 import { logAuditEvent } from '../../middleware/audit.js';
 import { aiClient } from '../ai/ai.client.js';
 import { assertClinicSeatAvailable } from '../../utils/subscriptionSeats.js';
+import { assertCanAddDoctor, assertCanAddStaff } from '../admin/entitlements.js';
 
 export class UserService {
   constructor(private readonly repo: UserRepository = userRepository) {}
@@ -47,7 +48,12 @@ export class UserService {
       requestId?: string;
     }
   ) {
-    await assertClinicSeatAvailable(clinicId);
+    const seat = dto.role === 'DOCTOR'
+      ? await assertCanAddDoctor(clinicId)
+      : await assertCanAddStaff(clinicId);
+    if (!seat.enforced) {
+      await assertClinicSeatAvailable(clinicId);
+    }
 
     const existing = await this.repo.findByEmailInClinic(clinicId, dto.email);
     if (existing) {

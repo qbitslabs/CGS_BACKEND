@@ -3,8 +3,17 @@ import { Response, NextFunction } from 'express';
 import { z } from 'zod';
 import { AuthenticatedRequest } from '../../types/index.js';
 import { AppError } from '../../middleware/errorHandler.js';
+import { outboundAllowed } from '../admin/entitlements.js';
 import { WHATSAPP_TEMPLATES } from './whatsappTemplates.js';
 import { previewTemplateSends, publicTemplate, queueTemplateSends } from './outbound.service.js';
+
+const OUTBOUND_PLAN_MESSAGE =
+  'Outbound campaigns are included on Scale. Invoices, new enquiries, and appointment reminders still send on this plan.';
+
+async function assertCampaignAllowed(clinicId: string) {
+  if (await outboundAllowed(clinicId)) return;
+  throw new AppError(OUTBOUND_PLAN_MESSAGE, 403, 'OUTBOUND_PLAN');
+}
 
 const recipientsSchema = z.object({
   templateKey: z.string().min(1),
@@ -24,8 +33,9 @@ function assertOwnClinic(req: AuthenticatedRequest, clinicId?: string) {
 
 const STAFF_TEMPLATE_KEYS = new Set(['BILL', 'OLD_PATIENT_REACTIVATION']);
 
-export const listTemplates = async (_req: AuthenticatedRequest, res: Response, next: NextFunction) => {
+export const listTemplates = async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
   try {
+    await assertCampaignAllowed(req.clinicId!);
     res.json({
       success: true,
       data: WHATSAPP_TEMPLATES.filter((item) => STAFF_TEMPLATE_KEYS.has(item.key)).map(publicTemplate),
@@ -46,6 +56,7 @@ export const previewOutbound = async (req: AuthenticatedRequest, res: Response, 
       );
     }
     const clinicId = assertOwnClinic(req, body.clinicId);
+    await assertCampaignAllowed(clinicId);
     const data = await previewTemplateSends(clinicId, body.templateKey, body);
     res.json({ success: true, data });
   } catch (error) {
@@ -64,6 +75,7 @@ export const sendOutbound = async (req: AuthenticatedRequest, res: Response, nex
       );
     }
     const clinicId = assertOwnClinic(req, body.clinicId);
+    await assertCampaignAllowed(clinicId);
     const data = await queueTemplateSends(clinicId, body.templateKey, body);
     res.status(202).json({ success: true, data });
   } catch (error) {

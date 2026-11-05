@@ -7,6 +7,7 @@ import { AppError } from '../../middleware/errorHandler.js';
 import { logAuditEvent } from '../../middleware/audit.js';
 import { queueTemplateSends } from '../whatsapp/outbound.service.js';
 import { prisma } from '../../config/db.js';
+import { packageMonthlyAmount } from '../admin/planCatalog.js';
 
 function formatInvoiceDoctorName(user?: { firstName?: string | null; lastName?: string | null } | null) {
   if (!user) return undefined;
@@ -347,9 +348,9 @@ export class BillingService {
       : new Date(new Date().getFullYear(), new Date().getMonth() + 1, 1).toISOString().slice(0, 10);
 
     return {
-      subscriptionPlan: subscription?.plan?.name || 'Clinic Growth Enterprise Plan (Full Growth Engine)',
-      planBillingCycle: 'Monthly (Auto-renews on 1st)',
-      subscriptionCost: Number(subscription?.plan?.priceMonthly || 25000),
+      subscriptionPlan: subscription?.plan?.name || 'Unassigned',
+      planBillingCycle: 'Monthly',
+      subscriptionCost: packageMonthlyAmount(subscription?.plan, Boolean(subscription?.earlyBird)),
       nextBillingDate,
       paymentStatus: subscription?.status || 'Active',
       whatsappApiUsage: {
